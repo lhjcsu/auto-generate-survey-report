@@ -141,6 +141,46 @@
     "9": { "name": "中粗砂", "default_result": "不液化" }
   },
 
+  "_comment_technical_standards": "技术标准配置: always=始终包含, conditional=按条件包含, condition可选值: has_rock_layers/has_rock_samples/has_water_samples/has_pile_foundation/has_basement/always",
+  "technical_standards": {
+    "always": [
+      {"code": "GB 55017-2021", "name": "工程勘察通用规范"},
+      {"code": "GB 55003-2021", "name": "建筑与市政地基基础通用规范"},
+      {"code": "GB 55002-2021", "name": "建筑与市政工程抗震通用规范"},
+      {"code": "GB 50021-2001(2009年版)", "name": "岩土工程勘察规范"},
+      {"code": "GB 50007-2011", "name": "建筑地基基础设计规范"},
+      {"code": "GB/T 50011-2010(2024版)", "name": "建筑抗震设计标准"},
+      {"code": "GB/T 50585-2019", "name": "岩土工程勘察安全标准"},
+      {"code": "GB 18306-2015", "name": "中国地震动参数区划图"},
+      {"code": "GB/T 50123-2019", "name": "土工试验方法标准"},
+      {"code": "DB37/T 5052-2015", "name": "建筑岩土工程勘察设计标准"},
+      {"code": "JGJ/T 72-2017", "name": "高层建筑岩土工程勘察标准"},
+      {"code": "JGJ/T 87-2012", "name": "建筑工程地质勘探与取样技术规程"},
+      {"code": "DB37/T 5226-2022", "name": "岩土工程勘察文件编制标准"},
+      {"code": "2020年版", "name": "房屋建筑和市政基础设施工程勘察文件编制深度规定"}
+    ],
+    "conditional": [
+      {"code": "GB/T 50218-2014", "name": "工程岩体分级标准", "condition": "has_rock_layers"},
+      {"code": "GB/T 50266-2013", "name": "工程岩体试验方法标准", "condition": "has_rock_samples"},
+      {"code": "GB 50330-2013", "name": "建筑边坡工程技术规范", "condition": "has_basement"},
+      {"code": "JGJ 94-2008", "name": "建筑桩基技术规范", "condition": "has_pile_foundation"},
+      {"code": "DZ/T 0064-2021", "name": "地下水质分析方法", "condition": "has_water_samples"},
+      {"code": "JGJ 476-2019", "name": "建筑工程抗浮技术标准", "condition": "has_basement"},
+      {"code": "JGJ 120-2012", "name": "建筑基坑支护技术规程", "condition": "has_basement"}
+    ],
+    "laws": [
+      "山东省建设工程抗震设防条例",
+      "住建部令第37号《危险性较大的分部分项工程安全管理规定》",
+      "鲁建质安字［2024］6号文"
+    ],
+    "other": [
+      "建设单位提供的工程总平面图",
+      "岩土工程勘察合同",
+      "岩土工程勘察委托任务书",
+      "勘察纲要"
+    ]
+  },
+
   "_comment_replacements": "全局文本替换规则: [原文本, 替换为], 在填充前执行",
   "replacements": [
     ["威海高区保税物流中心（B型）", "{project_name}"],

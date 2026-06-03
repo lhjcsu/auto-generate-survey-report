@@ -434,6 +434,10 @@ class ProjectConfig:
         """获取日期替换规则"""
         return [tuple(r) for r in self.raw.get("date_replacements", [])]
 
+    def get_technical_standards(self) -> Dict[str, Any]:
+        """获取技术标准配置"""
+        return self.raw.get("technical_standards", {})
+
 
 # ============================================================
 # 数据加载器
@@ -992,6 +996,7 @@ class ReportFiller:
         self._fill_liquefaction()
         self._fill_foundation_tables()
         self._fill_conclusion()
+        self._fill_standards()
         self._apply_date_replacements()
 
         logger.info(f"\n  保存: {self.output}")
@@ -1519,6 +1524,141 @@ class ReportFiller:
                     f"钻孔孔口高程{bh_info['elv_min']:.2f}～{bh_info['elv_max']:.2f}m"
                     f"(根据钻孔统计)。"
                 ))
+
+    # ---- 技术标准列表 (配置驱动 + 条件过滤) ----
+
+    def _fill_standards(self) -> None:
+        """根据配置和实际数据生成技术标准列表段落"""
+        standards_config = self.config.get_technical_standards()
+        if not standards_config:
+            return
+
+        # 始终包含的标准
+        always = standards_config.get("always", [])
+
+        # 按条件过滤的标准
+        conditional = standards_config.get("conditional", [])
+        conditions = self._evaluate_standard_conditions()
+
+        # 合并: 始终项 + 满足条件的条件项
+        all_standards = list(always)
+        for s in conditional:
+            cond = s.get("condition", "always")
+            if cond == "always" or conditions.get(cond, False):
+                all_standards.append(s)
+
+        # 法律法规和其他依据
+        laws = standards_config.get("laws", [])
+        other = standards_config.get("other", [])
+
+        # 组装格式化文本
+        lines: List[str] = []
+        idx = 1
+
+        if all_standards:
+            lines.append("1、国家标准：")
+            for s in all_standards:
+                lines.append(f"{idx})《{s['name']}》({s['code']})")
+                idx += 1
+
+        if laws:
+            lines.append("2、法律法规：")
+            for law in laws:
+                lines.append(f"{idx})《{law}》" if "《" not in law else f"{idx}){law}")
+                idx += 1
+
+        if other:
+            lines.append("3、其他：")
+            for item in other:
+                lines.append(f"{idx}){item}")
+                idx += 1
+
+        full_text = "\n".join(lines)
+
+        # 在模板中定位技术标准段落并替换
+        trigger_keywords = ["执行的主要技术标准", "技术标准", "勘察依据", "依据的技术标准"]
+        replaced = False
+
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if any(kw in txt for kw in trigger_keywords):
+                set_para_text(p, full_text)
+                replaced = True
+                # 清除后续已有的标准条目段落
+                for j in range(i + 1, min(i + 40, len(self.doc.paragraphs))):
+                    next_txt = self.doc.paragraphs[j].text.strip()
+                    if not next_txt:
+                        continue
+                    # 匹配标准条目格式: 数字)《...》(编号) 或 纯标准名称
+                    if (
+                        re.match(r"^\d+[)）、]", next_txt)
+                        or "《" in next_txt and "(" in next_txt
+                        or next_txt.startswith(("国家标准", "行业标准", "地方标准", "法律法规", "其他"))
+                    ):
+                        set_para_text(self.doc.paragraphs[j], "")
+                    elif any(kw in next_txt for kw in ("工程概况", "勘察目的", "场地", "拟建")):
+                        break  # 已到达下一个章节
+                break
+
+        if replaced:
+            included = [s["name"] for s in all_standards]
+            excluded = [
+                s["name"] for s in conditional
+                if s.get("condition", "always") != "always"
+                and not conditions.get(s["condition"], False)
+            ]
+            logger.info(f"  技术标准: 纳入 {len(all_standards)} 条, 排除 {len(excluded)} 条")
+            if excluded:
+                logger.debug(f"    排除: {', '.join(excluded)}")
+        else:
+            logger.debug("  技术标准: 未找到匹配段落，跳过")
+
+    def _evaluate_standard_conditions(self) -> Dict[str, bool]:
+        """评估标准条件，返回各条件是否满足"""
+        layer_ids = self.layer_ids
+        bh_info = self.data.get("borehole_info", {})
+        buildings = self.data.get("buildings", [])
+        water_samples = self.data.get("water_samples", [])
+
+        # 有岩层: 层号含 "10-" 等
+        has_rock_layers = any("-" in str(lid) for lid in layer_ids)
+
+        # 有岩石试验样品
+        has_rock_samples = (bh_info.get("rock", 0) or 0) > 0
+
+        # 有水样
+        has_water_samples = len(water_samples) > 0
+
+        # 配置了桩基参数
+        has_pile = any(
+            self.config.get_pile_values(lid) is not None
+            for lid in layer_ids
+        )
+
+        # 有地下室/地下结构
+        has_basement = False
+        for b in buildings:
+            floors_str = b.get("floors", "")
+            height_str = b.get("height", "")
+            # 检查是否有地下层数标注 (如 "地上18层/地下1层")
+            if "地下" in floors_str:
+                has_basement = True
+                break
+            # 检查备注或结构字段
+            for field in ["size", "span", "indoor_elv", "structure"]:
+                if "地下" in str(b.get(field, "")):
+                    has_basement = True
+                    break
+            if has_basement:
+                break
+
+        return {
+            "has_rock_layers": has_rock_layers,
+            "has_rock_samples": has_rock_samples,
+            "has_water_samples": has_water_samples,
+            "has_pile_foundation": has_pile,
+            "has_basement": has_basement,
+        }
 
     # ---- 日期替换 (配置驱动) ----
 
