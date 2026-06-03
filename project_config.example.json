@@ -1,0 +1,162 @@
+{
+  "project_name": "威海高区保税物流中心（B型）项目",
+  "base_dir": "D:\\项目\\威海高区保税物流中心（B型）项目",
+  "excel_dir": "已有资料\\excel表格",
+  "template": "25019威海高区保税物流中心.docx",
+  "output_suffix": "_正式报告",
+
+  "_comment_table_indices": "docx 中表格的序号索引 (从 0 开始), 不同模板可能需要调整",
+  "table_indices": {
+    "buildings": 2,
+    "workload": 3,
+    "phys_spt_start": 4,
+    "phys_spt_end": 15,
+    "water_level": 16,
+    "bearing_capacity": 18,
+    "water_sample": 19,
+    "water_corrosion": 20,
+    "salt_sample": 21,
+    "salt_corrosion": 22,
+    "foundation_type": 23,
+    "pile_params": 24
+  },
+
+  "borehole_type_names": {
+    "标贯孔": "标贯孔",
+    "取土孔": "取土孔",
+    "一般性钻孔": "一般性钻孔",
+    "重探": "重探孔"
+  },
+
+  "_comment_layers": "地层配置: id=层号, name=名称, table_type=表格类型(cpt/spt/phys/spt_rock/none), description=描述模板, bearing=承载力参数, pile=桩基参数",
+  "layers": [
+    {
+      "id": "1",
+      "name": "杂填土",
+      "table_type": "cpt",
+      "description": "黄褐色、灰褐色，松散、局部中密，强度不均，主要成分风化岩渣土、碎石及建筑垃圾，块石在各孔分布不均，块石含量20~30%，径多为10~30cm，最大80cm左右，局部深度以块石、建筑垃圾为主。回填时间8年，尚未完成自重固结。场区普遍分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "/", "es": "/", "e0": "/", "gamma": "19.0", "c": "3.0", "phi": "18" },
+      "pile": { "qsik1": "22", "qpk1": "/", "qsik2": "22", "qpk2": "/" }
+    },
+    {
+      "id": "2",
+      "name": "细砂",
+      "table_type": "spt",
+      "description": "灰黑色、灰色，顶部松散，中下部稍密，饱和，主要成分长石、石英及少量云母，夹少量贝壳碎片，颗粒较均匀。场区普遍分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "130", "es": "10.0", "e0": "", "gamma": "19.5", "c": "", "phi": "28" },
+      "pile": { "qsik1": "22", "qpk1": "/", "qsik2": "22", "qpk2": "/" }
+    },
+    {
+      "id": "3",
+      "name": "淤泥质粉质黏土",
+      "table_type": "phys",
+      "spt_stats_layer": "3",
+      "description": "灰～灰黑色，软塑，土质较均匀，局部夹粉质黏土和细砂薄层，含贝壳碎片，稍具腥臭味。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "70", "es": "3.5", "e0": "", "gamma": "17.5", "c": "15", "phi": "8" },
+      "pile": { "qsik1": "25", "qpk1": "/", "qsik2": "25", "qpk2": "/" }
+    },
+    {
+      "id": "4",
+      "name": "粉质黏土",
+      "table_type": "phys",
+      "spt_stats_layer": "4",
+      "description": "黄灰色~灰褐色，可塑，粉粒及黏粒组成，土质较均匀，局部夹粉细砂透镜体薄层。无摇振反应，切面光滑，干强度及韧性中等。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "180", "es": "7.0", "e0": "", "gamma": "19.2", "c": "20", "phi": "15" },
+      "pile": { "qsik1": "25", "qpk1": "/", "qsik2": "25", "qpk2": "/" }
+    },
+    {
+      "id": "5",
+      "name": "中细砂",
+      "table_type": "spt",
+      "description": "浅灰色、黄褐色，中密，饱和，主要成分长石、石英，颗粒不均，含少量砾粒，局部夹粉质黏土薄层，磨圆度较差。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "200", "es": "15.0", "e0": "", "gamma": "19.5", "c": "", "phi": "30" },
+      "pile": { "qsik1": "45", "qpk1": "/", "qsik2": "45", "qpk2": "/" }
+    },
+    {
+      "id": "6",
+      "name": "粉质黏土",
+      "table_type": "phys",
+      "spt_stats_layer": "6",
+      "description": "黄褐色，硬塑，粉粒及黏粒组成，土质不均匀，中下部含少量中粗砂，局部夹细砂透镜体薄层。无摇振反应，切面光滑，干强度及韧性中等。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "210", "es": "8.0", "e0": "", "gamma": "19.5", "c": "36", "phi": "18" },
+      "pile": { "qsik1": "25", "qpk1": "/", "qsik2": "25", "qpk2": "/" }
+    },
+    {
+      "id": "7",
+      "name": "中粗砂",
+      "table_type": "spt",
+      "description": "灰褐色、灰白色，密实，饱和。主要成分长石、石英，颗粒不均，夹粗砾砂，含砾石，粒径2～5mm左右，磨圆度较差。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "280", "es": "20.0", "e0": "", "gamma": "20.0", "c": "", "phi": "32" },
+      "pile": { "qsik1": "70", "qpk1": "6000", "qsik2": "70", "qpk2": "5000" }
+    },
+    {
+      "id": "8",
+      "name": "粉质黏土",
+      "table_type": "phys",
+      "spt_stats_layer": "8",
+      "description": "浅黄褐色、棕褐色，硬塑~坚硬，以黏性土为主，含较多砂粒及砾石，无摇振反应，切面有光泽，干强度、韧性高。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "240", "es": "9.0", "e0": "", "gamma": "19.8", "c": "32", "phi": "20" },
+      "pile": { "qsik1": "45", "qpk1": "/", "qsik2": "45", "qpk2": "/" }
+    },
+    {
+      "id": "9",
+      "name": "中粗砂",
+      "table_type": "spt",
+      "description": "黄褐色、棕褐色，密实，饱和，主要成分为长石、石英，颗粒不均匀，磨圆度差，底部夹大量的砾石、碎石及风化碎屑。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "350", "es": "25.0", "e0": "", "gamma": "20.5", "c": "", "phi": "35" },
+      "pile": { "qsik1": "80", "qpk1": "7000", "qsik2": "80", "qpk2": "6000" }
+    },
+    {
+      "id": "10-1",
+      "name": "全风化片麻岩",
+      "table_type": "spt_rock",
+      "description": "浅黄褐色、灰黄色,风化程度强,主要成分长石、石英及暗色矿物,暗色矿物偏多,裂隙为砂土~中密状,岩芯散碎。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "450", "es": "40.0", "e0": "", "gamma": "22.0", "c": "", "phi": "35" },
+      "pile": { "qsik1": "80", "qpk1": "/", "qsik2": "80", "qpk2": "/" }
+    },
+    {
+      "id": "10-2",
+      "name": "强风化片麻岩",
+      "table_type": "spt_rock",
+      "description": "黄褐色、灰黄色，主要成分长石、石英及暗色矿物，原岩结构已破坏，风化裂隙很发育，细粒结构，片麻状构造，风化强，上部较破碎，下部要为块状结构，呈风化砂状。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "700", "es": "60.0", "e0": "", "gamma": "23.0", "c": "", "phi": "40" },
+      "pile": { "qsik1": "100", "qpk1": "8000", "qsik2": "100", "qpk2": "7000" }
+    },
+    {
+      "id": "10-3",
+      "name": "碎块状强风化片麻岩",
+      "table_type": "none",
+      "description": "灰黄色、灰褐色,主要成分长石、石英及暗色矿物，细粒结构，片麻状构造，风化强，上部较破碎，岩芯要为碎块状、块状为主。场区{dist}分布，厚度:{thick_min}~{thick_max}m,平均{thick_avg}m;层底标高:{elv_min}~{elv_max}m,平均{elv_avg}m;层底埋深:{depth_min}~{depth_max}m,平均{depth_avg}m。",
+      "bearing": { "fak": "1200", "es": "", "e0": "", "gamma": "24.0", "c": "", "phi": "45" },
+      "pile": { "qsik1": "120", "qpk1": "10000", "qsik2": "120", "qpk2": "9000" }
+    }
+  ],
+
+  "water_aquifer_layers": ["1", "2", "5", "7", "9"],
+
+  "liquefaction_layers": {
+    "2": { "name": "中细砂", "default_result": "轻微" },
+    "5": { "name": "中细砂", "default_result": "不液化" },
+    "7": { "name": "中粗砂", "default_result": "不液化" },
+    "9": { "name": "中粗砂", "default_result": "不液化" }
+  },
+
+  "_comment_replacements": "全局文本替换规则: [原文本, 替换为], 在填充前执行",
+  "replacements": [
+    ["威海高区保税物流中心（B型）", "{project_name}"],
+    ["38056.76", "约105000"]
+  ],
+
+  "_comment_date_replacements": "日期替换规则 (不再硬编码, 按项目配置)",
+  "date_replacements": [
+    ["2025年11月", "2025年12月"]
+  ],
+
+  "workload_paragraph": {
+    "control_holes": 45,
+    "wave_velocity_holes": 6,
+    "template": "本次勘察实际完成钻孔{total}个，其中控制孔{control}个，一般孔{general}个。其中取土孔{qutu}个、标贯孔{biaoguan}个，鉴别孔{yiban}个，波速孔{wave}个勘察工作量统计表见表3-1。"
+  },
+
+  "water_paragraph_template": "勘察期间测得钻孔内水位埋深约{depth_min}~{depth_max}m，水位标高{elv_min}~{elv_max}m，详见表5-13。根据场地地下水的埋藏条件，地下水类型为第四系孔隙潜水，主要含水层为{aquifer_desc}。"
+}
