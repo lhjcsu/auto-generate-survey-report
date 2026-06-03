@@ -1279,6 +1279,49 @@ class ReportFiller:
                     f"勘察工作量统计表见表3-1。"
                 ))
 
+        # --- 勘察方法条件过滤 (第三章(一)) ---
+        # N63.5 动力触探: 无数据时删除
+        has_n63 = bh_info.get("n63_total", 0) > 0
+
+        # 波速测试: 无高层建筑 (>24m) 时删除
+        buildings = self.data.get("buildings", [])
+        has_highrise = False
+        for b in buildings:
+            h_str = str(b.get("height", ""))
+            # 提取数字部分 (兼容 "36m", "36.5", "18F" 等格式)
+            h_match = re.match(r"(\d+\.?\d*)", h_str)
+            h_val = float(h_match.group(1)) if h_match else 0
+            if h_val > 24:
+                has_highrise = True
+                break
+
+        if not has_n63 or not has_highrise:
+            cleared = 0
+            for p in self.doc.paragraphs:
+                txt = p.text.strip()
+                if not txt:
+                    continue
+                if not has_n63 and ("N63.5" in txt or "动力触探" in txt):
+                    set_para_text(p, "")
+                    cleared += 1
+                elif not has_highrise and "波速测试" in txt:
+                    set_para_text(p, "")
+                    cleared += 1
+            if cleared:
+                logger.info(f"    勘察方法: 条件删除 {cleared} 段 (N63.5={has_n63}, 高层={has_highrise})")
+
+        # --- 质量评述: 勘察等级注入 (第三章(五)) ---
+        overview = self.config.get_project_overview()
+        survey_grade = (overview or {}).get("survey_grade", "")
+        if survey_grade:
+            for p in self.doc.paragraphs:
+                txt = p.text.strip()
+                if "勘察等级为" in txt:
+                    for grade in ("甲级", "乙级", "丙级"):
+                        if grade in txt:
+                            replace_in_para(p, grade, survey_grade)
+                            break
+
     # ---- 水位表 + 段落 ----
 
     def _fill_water_level(self) -> None:
