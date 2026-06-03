@@ -458,6 +458,10 @@ class ProjectConfig:
         """获取岩土工程分析评价配置 (第六章各子节段落)"""
         return self.raw.get("analysis_evaluation", {})
 
+    def get_conclusion_suggestions(self) -> Dict[str, Any]:
+        """获取结论与建议配置 (第七章: conclusion/suggestions 段落数组)"""
+        return self.raw.get("conclusion_suggestions", {})
+
 
 # ============================================================
 # 数据加载器
@@ -1680,29 +1684,155 @@ class ReportFiller:
             set_cell(t24, li + 2, 4, q3)
             set_cell(t24, li + 2, 5, q4)
 
-    # ---- 结论段落 ----
+    # ---- 第七章: 结论与建议 ----
 
     def _fill_conclusion(self) -> None:
-        logger.info("  结论段落...")
-        bh_info = self.data["borehole_info"]
+        """填充第七章结论与建议 (配置驱动 + 自动占位符注入)
 
-        for p in self.doc.paragraphs:
-            txt = p.text.strip()
-            if "场地土主要由" in txt:
-                names = "、".join(
-                    self.layer_names[lid]
-                    for lid in self.layer_ids
-                    if lid in self.layer_names
-                )
-                if names:
-                    set_para_text(p, f"场地土主要由{names}等组成。")
-            if "钻孔孔口高程" in txt and "elv_min" in bh_info:
-                set_para_text(p, (
-                    f"所处地貌为山前海积、冲洪积小平原交界地带，"
-                    f"场地经整平后地形较平缓，"
-                    f"钻孔孔口高程{bh_info['elv_min']:.2f}～{bh_info['elv_max']:.2f}m"
-                    f"(根据钻孔统计)。"
-                ))
+        配置结构 conclusion_suggestions:
+            conclusion:   (一)结论 — 段落数组, 支持占位符
+            suggestions:  (二)建议 — 段落数组
+
+        自动占位符:
+            {layer_names}        地层名称列表
+            {elv_min}            最低孔口高程
+            {elv_max}            最高孔口高程
+            {elv_range}          高程范围
+            {frozen_depth}       标准冻结深度
+            {liquefaction_text}  液化判别结论
+            {stability_grade}    场地稳定性等级
+            {suitability_grade}  适宜性等级
+            {corrosion_water}    地下水腐蚀性结论
+            {corrosion_soil}     场地土腐蚀性结论
+        """
+        cs = self.config.get_conclusion_suggestions()
+        if not cs:
+            return
+
+        # --- 自动生成占位符数据 ---
+        bh_info = self.data.get("borehole_info", {})
+        overview = self.config.get_project_overview() or {}
+        site_eval = self.config.get_site_evaluation() or {}
+
+        # 地层名称
+        layer_names = "、".join(
+            self.layer_names[lid]
+            for lid in self.layer_ids
+            if lid in self.layer_names
+        )
+
+        # 高程统计
+        elv_min = bh_info.get("elv_min")
+        elv_max = bh_info.get("elv_max")
+        elv_range = ""
+        if elv_min is not None and elv_max is not None:
+            elv_range = f"{elv_min:.2f}～{elv_max:.2f}m"
+
+        # 液化判别
+        liq_data, liq_liq, liq_non = self.data.get(
+            "liquefaction", ([], 0, 0)
+        )
+        if liq_liq > 0:
+            liq_text = "存在液化土层"
+        elif liq_data:
+            liq_text = "不液化"
+        else:
+            liq_text = "未揭露液化土层"
+
+        # 腐蚀性评价 (从数据自动提取)
+        water_samples = self.data.get("water_samples", [])
+        salt_samples = self.data.get("salt_samples", [])
+        corr = evaluate_corrosion(water_samples, salt_samples)
+        corr_water = ""
+        corr_soil = ""
+        if corr.get("water"):
+            wc = corr["water"]
+            worst = max(
+                wc["II_conc"].values(),
+                key=lambda x: ["微", "弱", "中", "强"].index(x),
+            )
+            corr_water = f"地下水对混凝土结构具{worst}腐蚀性"
+        if corr.get("salt"):
+            sc = corr["salt"]
+            worst_s = max(
+                sc["II_conc"].values(),
+                key=lambda x: ["微", "弱", "中", "强"].index(x),
+            )
+            corr_soil = f"场地土对混凝土结构具{worst_s}腐蚀性"
+
+        fmt_vars: Dict[str, str] = {
+            "layer_names": layer_names,
+            "elv_min": fmt_val(elv_min),
+            "elv_max": fmt_val(elv_max),
+            "elv_range": elv_range,
+            "frozen_depth": overview.get("frozen_depth", ""),
+            "liquefaction_text": liq_text,
+            "stability_grade": site_eval.get("stability_grade", "基本稳定"),
+            "suitability_grade": site_eval.get("suitability_grade", "较适宜"),
+            "corrosion_water": corr_water,
+            "corrosion_soil": corr_soil,
+        }
+
+        # --- 处理 (一)结论 子节 ---
+        conclusion_paras = cs.get("conclusion", [])
+        if conclusion_paras:
+            self._fill_conclusion_subsection(
+                "(一)结论", conclusion_paras, fmt_vars,
+            )
+
+        # --- 处理 (二)建议 子节 ---
+        suggestions_paras = cs.get("suggestions", [])
+        if suggestions_paras:
+            self._fill_conclusion_subsection(
+                "(二)建议", suggestions_paras, fmt_vars,
+            )
+
+    def _fill_conclusion_subsection(
+        self,
+        heading: str,
+        config_paras: List[str],
+        fmt_vars: Dict[str, str],
+    ) -> None:
+        """填充结论/建议子节的段落"""
+        # 定位子节标题
+        start_idx: Optional[int] = None
+        for i, p in enumerate(self.doc.paragraphs):
+            if heading in p.text:
+                start_idx = i + 1
+                break
+        if start_idx is None:
+            return
+
+        # 找到子节结束位置 (下一个同级标题或文档末尾)
+        end_idx = len(self.doc.paragraphs)
+        for j in range(start_idx, len(self.doc.paragraphs)):
+            txt = self.doc.paragraphs[j].text.strip()
+            if txt.startswith("(") and ")" in txt[:6] and heading not in txt:
+                end_idx = j
+                break
+            if txt.startswith("七") or txt.startswith("八"):
+                end_idx = j
+                break
+
+        # 格式化并替换
+        replaced = 0
+        for k, tpl in enumerate(config_paras):
+            try:
+                text = tpl.format(**fmt_vars)
+            except KeyError:
+                text = tpl
+            idx = start_idx + k
+            if idx < end_idx:
+                set_para_text(self.doc.paragraphs[idx], text)
+                replaced += 1
+
+        # 多余模板段落清空
+        for j in range(start_idx + len(config_paras), end_idx):
+            if self.doc.paragraphs[j].text.strip():
+                set_para_text(self.doc.paragraphs[j], "")
+
+        if replaced:
+            logger.info(f"  结论{heading}: 替换 {replaced} 段")
 
     # ---- 第五章: 场地条件 (地形地貌/地下水/地震/不良地质) ----
 

@@ -251,6 +251,34 @@
     ]
   },
 
+  "_comment_conclusion_suggestions": "第七章结论与建议: conclusion=(一)结论段落数组, suggestions=(二)建议段落数组。占位符: {layer_names} {elv_range} {frozen_depth} {liquefaction_text} {stability_grade} {suitability_grade} {corrosion_water} {corrosion_soil}",
+  "conclusion_suggestions": {
+    "conclusion": [
+      "1、依据区域地质资料分析，拟建场地所处大地构造背景稳定，第四纪以来未发现新构造运动迹象，滑坡、崩塌和泥石流等不良地质作用不发育，勘察过程中勘探点位置勘察深度范围内也未发现埋藏的对工程不利的埋藏物，场地{liquefaction_text}，参考《城乡工程地质勘察规范》(CJJ57-2012)相关条文，场地稳定性{stability_grade}，适宜性{suitability_grade}，适宜建筑物的兴建。",
+      "2、勘察场地所处地貌单元及地形地势描述。地面标高{elv_range}(根据钻孔统计)。",
+      "场地地层主要为{layer_names}等。",
+      "3、场地季节性冻土标准冻结深度为{frozen_depth}。",
+      "4、地表水及地下水描述。",
+      "5、地震参数、液化判别及抗震设防描述。",
+      "6、腐蚀性评价：",
+      "{corrosion_water}；{corrosion_soil}。"
+    ],
+    "suggestions": [
+      "1、场地各土层参数取值建议值见表7-1。",
+      "2、地基基础方案建议及基础持力层详见基础选型表；桩基方案建议详见桩基评价。",
+      "3、同一结构单元的基础不宜设置在性质截然不同的地基上。",
+      "4、特殊性岩土处理建议。",
+      "5、抗浮设防水位建议。",
+      "6、地基均匀性详见均匀性评价表。",
+      "7、地基稳定性评价。",
+      "8、基坑开挖建议。",
+      "9、工程风险提示。",
+      "10、本报告钻孔布置间距符合规范要求，钻孔间地质情况若与推断不同，请联系各方进行处理。",
+      "11、基槽开挖前，建设单位应组织勘察单位进行技术交底，基槽开挖后应及时通知验槽。",
+      "12、基础施工过程中如遇其它岩土工程问题，请及时通知勘察和设计部门。"
+    ]
+  },
+
   "_comment_technical_standards": "技术标准配置: always=始终包含, conditional=按条件包含, condition可选值: has_rock_layers/has_rock_samples/has_water_samples/has_pile_foundation/has_basement/always",
   "technical_standards": {
     "always": [
