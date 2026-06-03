@@ -454,6 +454,10 @@ class ProjectConfig:
         """获取场地条件配置 (第五章: 地形地貌/地下水/地震/不良地质)"""
         return self.raw.get("site_conditions", {})
 
+    def get_analysis_evaluation(self) -> Dict[str, Any]:
+        """获取岩土工程分析评价配置 (第六章各子节段落)"""
+        return self.raw.get("analysis_evaluation", {})
+
 
 # ============================================================
 # 数据加载器
@@ -1017,6 +1021,7 @@ class ReportFiller:
         self._fill_site_conditions()
         self._fill_site_evaluation()
         self._fill_foundation_evaluation()
+        self._fill_analysis_evaluation()    # 16. 第六章: 分析评价各子节
         self._fill_standards()
         self._apply_date_replacements()
 
@@ -2056,6 +2061,198 @@ class ReportFiller:
                 "场地内未发现明显的软弱下卧层，"
                 "各土层承载力可满足一般建筑天然地基要求。"
             )
+
+    # ---- 第六章: 岩土工程分析评价 (配置驱动段落填充) ----
+
+    def _fill_analysis_evaluation(self) -> None:
+        """填充第六章岩土工程分析评价各子节
+
+        配置结构 analysis_evaluation:
+            layer_eval:       (一)岩土层逐层工程评价 — key为层号(如"1","1-1")
+            anti_float:       (四)3 地下水的力学作用/抗浮
+            foundation_text:  (五)1 基础选型补充说明
+            pile_eval:        (五)2 桩基评价综合文字
+            special_soils:    (六)特殊性岩土工程分析评价
+            stability:        (八)地基稳定性评价
+            excavation:       (九)基坑开挖有关问题 (has_basement=False时清空)
+            risk:             (十)地质条件可能造成的工程风险 (has_basement=False时清空)
+            deformation:      (十一)建筑物变形分析
+        """
+        ae = self.config.get_analysis_evaluation()
+        if not ae:
+            return
+
+        # 有地下室判断 (基坑/风险章节条件控制)
+        overview = self.config.get_project_overview()
+        conditions = self._evaluate_standard_conditions()
+        has_basement = (overview or {}).get(
+            "has_basement", conditions.get("has_basement", False)
+        )
+
+        # 章节映射: (触发关键词列表, 配置键, 条件类型)
+        #   cond=None: 始终处理
+        #   cond="basement": 仅 has_basement=True 时处理, 否则清空
+        sections: List[Tuple[List[str], str, Any]] = [
+            (
+                ["岩土层(体)工程分析", "岩土层(体)工程评价"],
+                "layer_eval", None,
+            ),
+            (
+                ["地下水的力学作用"],
+                "anti_float", None,
+            ),
+            (
+                ["地基及基础方案", "基础选型"],
+                "foundation_text", None,
+            ),
+            (
+                ["桩基评价", "桩基形式"],
+                "pile_eval", None,
+            ),
+            (
+                ["特殊性岩土"],
+                "special_soils", None,
+            ),
+            (
+                ["地基稳定性评价"],
+                "stability", None,
+            ),
+            (
+                ["基坑开挖有关问题", "基坑开挖"],
+                "excavation", "basement",
+            ),
+            (
+                ["工程风险"],
+                "risk", "basement",
+            ),
+            (
+                ["建筑物变形分析"],
+                "deformation", None,
+            ),
+        ]
+
+        current_section: Optional[str] = None
+        current_config_key: Optional[str] = None
+        section_start: int = 0
+        replaced_count = 0
+
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+
+            # --- 检测章节标题 (合并专用 + 通用检测) ---
+            matched_section_key: Optional[str] = None
+
+            # 1) 专用关键词匹配 (sections 列表)
+            for keywords, config_key, cond in sections:
+                if any(kw in txt for kw in keywords):
+                    matched_section_key = config_key
+                    break
+
+            # 2) 通用标题模式: 括号格式 (X) 或已知非括号标题
+            if not matched_section_key:
+                if (
+                    (txt.startswith("(") and ")" in txt[:6])
+                    or txt in ("基坑开挖有关问题",)
+                ):
+                    matched_section_key = "__boundary__"
+
+            # 处理检测结果
+            if matched_section_key:
+                # 先 flush 上一个章节
+                if current_section:
+                    replaced_count += self._process_analysis_section(
+                        current_section, current_config_key,
+                        section_start, i, ae, has_basement,
+                    )
+
+                if matched_section_key == "__boundary__":
+                    # 不关心的章节, 重置状态
+                    current_section = None
+                    current_config_key = None
+                else:
+                    current_section = txt
+                    current_config_key = matched_section_key
+                    section_start = i + 1
+
+        # 处理最后一个章节
+        if current_section:
+            replaced_count += self._process_analysis_section(
+                current_section, current_config_key,
+                section_start, len(self.doc.paragraphs), ae, has_basement,
+            )
+
+        if replaced_count:
+            logger.info(f"  分析评价: 处理 {replaced_count} 个子节")
+        else:
+            logger.debug("  分析评价: 未找到匹配章节")
+
+    def _process_analysis_section(
+        self,
+        heading: str,
+        config_key: Optional[str],
+        start: int,
+        end: int,
+        ae: Dict[str, Any],
+        has_basement: bool,
+    ) -> int:
+        """处理第六章的一个子节
+
+        返回处理的段落数。
+        """
+        if not config_key:
+            return 0
+
+        config_data = ae.get(config_key, None)
+
+        # === 条件清空: 无基坑时清空基坑/风险章节 ===
+        # 匹配条件: 标题中包含 "基坑" 或 "工程风险"
+        if not has_basement and (
+            "基坑" in heading or "工程风险" in heading
+        ):
+            cleared = 0
+            for j in range(start, end):
+                if self.doc.paragraphs[j].text.strip():
+                    set_para_text(self.doc.paragraphs[j], "")
+                    cleared += 1
+            if cleared:
+                logger.info(
+                    f"    {config_key}: 无基坑, 清空 {cleared} 段"
+                )
+            return cleared
+
+        if not config_data:
+            return 0
+
+        # === (一) 岩土层逐层评价: 按层号匹配 ===
+        if config_key == "layer_eval" and isinstance(config_data, dict):
+            replaced = 0
+            for j in range(start, end):
+                txt_j = self.doc.paragraphs[j].text.strip()
+                if not txt_j:
+                    continue
+                for layer_key, layer_text in config_data.items():
+                    if layer_text and txt_j.startswith(f"第{layer_key}层"):
+                        set_para_text(self.doc.paragraphs[j], layer_text)
+                        replaced += 1
+                        break
+            return replaced
+
+        # === 通用段落替换 ===
+        if not isinstance(config_data, list):
+            config_data = [str(config_data)]
+
+        replaced = 0
+        for k, text in enumerate(config_data):
+            idx = start + k
+            if idx < end:
+                set_para_text(self.doc.paragraphs[idx], text)
+                replaced += 1
+        # 多余模板段落清空
+        for j in range(start + len(config_data), end):
+            if self.doc.paragraphs[j].text.strip():
+                set_para_text(self.doc.paragraphs[j], "")
+
+        return replaced
 
     # ---- 技术标准列表 (配置驱动 + 条件过滤) ----
 
