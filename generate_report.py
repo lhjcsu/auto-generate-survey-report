@@ -446,6 +446,14 @@ class ProjectConfig:
         """获取地基评价配置 (4.5.7 §2 均匀性 / §5 软弱下卧层 / §6 变形参数)"""
         return self.raw.get("foundation_evaluation", {})
 
+    def get_project_overview(self) -> Dict[str, Any]:
+        """获取拟建工程概况配置 (第一章)"""
+        return self.raw.get("project_overview", {})
+
+    def get_site_conditions(self) -> Dict[str, Any]:
+        """获取场地条件配置 (第五章: 地形地貌/地下水/地震/不良地质)"""
+        return self.raw.get("site_conditions", {})
+
 
 # ============================================================
 # 数据加载器
@@ -993,6 +1001,7 @@ class ReportFiller:
         logger.info("=" * 60)
 
         self._global_replace()
+        self._fill_project_overview()
         self._fill_buildings_table()
         self._fill_workload()
         self._fill_water_level()
@@ -1004,6 +1013,7 @@ class ReportFiller:
         self._fill_liquefaction()
         self._fill_foundation_tables()
         self._fill_conclusion()
+        self._fill_site_conditions()
         self._fill_site_evaluation()
         self._fill_foundation_evaluation()
         self._fill_standards()
@@ -1028,6 +1038,101 @@ class ReportFiller:
                     for cell in row.cells:
                         for cp in cell.paragraphs:
                             replace_in_para(cp, old, new)
+
+    # ---- 第一章: 拟建工程概况 ----
+
+    def _fill_project_overview(self) -> None:
+        """填充拟建工程概况章节（第一章）
+
+        配置字段:
+            commission_text:    委托段落全文（支持 {client}/{project_name}/{survey_stage} 占位符）
+            site_location:      场地位置描述段落
+            building_desc:      建筑物描述段落（含面积、层数等）
+            importance_level:   重要性等级（一级/二级/三级）
+            site_complexity:    场地复杂程度等级（一级/二级/三级）
+            foundation_grade:   地基等级（一级/二级/三级）
+            survey_grade:       岩土工程勘察等级（甲级/乙级/丙级）
+            survey_grade_text:  勘察等级完整描述（覆盖自动拼装）
+        """
+        overview = self.config.get_project_overview()
+        if not overview:
+            return
+
+        # 准备占位符
+        fmt_vars: Dict[str, str] = {
+            "client": overview.get("client", ""),
+            "project_name": overview.get("project_name", self.config.project_name),
+            "survey_stage": overview.get("survey_stage", "详细勘察"),
+        }
+
+        # 自动拼装勘察等级文字
+        grade_parts = []
+        for key, label in [
+            ("importance_level", "重要性等级"),
+            ("site_complexity", "场地复杂程度等级"),
+            ("foundation_grade", "地基等级"),
+        ]:
+            val = overview.get(key, "")
+            if val:
+                grade_parts.append(f"{label}{val}")
+        survey_grade = overview.get("survey_grade", "")
+        if survey_grade:
+            grade_parts.append(f"综合确定岩土工程勘察等级为{survey_grade}")
+        auto_grade_text = "，".join(grade_parts) + "。" if grade_parts else ""
+        grade_text = overview.get("survey_grade_text", auto_grade_text)
+
+        # 在模板中定位并替换
+        commission_text = overview.get("commission_text", "")
+        site_location = overview.get("site_location", "")
+        building_desc = overview.get("building_desc", "")
+
+        replaced_count = 0
+        for p in self.doc.paragraphs:
+            txt = p.text.strip()
+            if not txt:
+                continue
+
+            # 1. 委托段落: 匹配 "受XX的委托" 或 "承担了" 开头
+            if commission_text and ("的委托" in txt or "承担了" in txt):
+                try:
+                    full_text = commission_text.format(**fmt_vars)
+                except KeyError:
+                    full_text = commission_text
+                set_para_text(p, full_text)
+                replaced_count += 1
+                continue
+
+            # 2. 场地位置: 匹配 "勘察场地位于" 开头
+            if site_location and txt.startswith("勘察场地位于"):
+                set_para_text(p, site_location)
+                replaced_count += 1
+                continue
+
+            # 3. 建筑物描述: 匹配 "本次勘察建筑物" 或 "总建筑面积"
+            if building_desc and (
+                "本次勘察建筑物" in txt or "总建筑面积" in txt
+            ):
+                set_para_text(p, building_desc)
+                replaced_count += 1
+                continue
+
+            # 4. 勘察等级: 匹配 "岩土工程勘察等级"
+            if grade_text and "岩土工程勘察等级" in txt:
+                set_para_text(p, grade_text)
+                replaced_count += 1
+                continue
+
+            # 5. 标准冻结深度 (第四章): 匹配 "标准冻结深度"
+            frozen_depth = overview.get("frozen_depth", "")
+            if frozen_depth and "标准冻结深度" in txt:
+                set_para_text(p, f"场地土标准冻结深度{frozen_depth}。")
+                replaced_count += 1
+                continue
+
+        if replaced_count:
+            logger.info(f"  工程概况: 替换 {replaced_count} 段")
+        else:
+            logger.debug("  工程概况: 未找到匹配段落")
 
     # ---- 建筑物特征表 ----
 
@@ -1534,6 +1639,88 @@ class ReportFiller:
                     f"钻孔孔口高程{bh_info['elv_min']:.2f}～{bh_info['elv_max']:.2f}m"
                     f"(根据钻孔统计)。"
                 ))
+
+    # ---- 第五章: 场地条件 (地形地貌/地下水/地震/不良地质) ----
+
+    def _fill_site_conditions(self) -> None:
+        """填充第五章各子节的文字段落
+
+        配置结构 site_conditions:
+            terrain_text:       地貌描述 (触发: "地貌单元" 或 "地貌")
+            topography_text:    地形地势 (触发: "地形地势" 或 "钻孔孔口高程")
+            environment_text:   周边环境 (触发: "场区周边环境" 或 "建筑红线")
+            surface_water_text: 地表水 (触发: "地表水" 或 "地表水体")
+            seismic_params_text: 地震参数 (触发: "地震设计基本参数" 或 "设计基本地震动")
+            site_class_text:    场地类别 (触发: "等效剪切波速" 或 "场地类别判定")
+            seismic_stability_text: 地震稳定性 (触发: "地震稳定性")
+            seismic_zone_text:  抗震地段 (触发: "抗震地段" 或 "抗震一般地段")
+            soft_soil_text:     软土震陷 (触发: "软土震陷" 或 "震陷判别")
+            adverse_text:       不良地质作用 (触发: "不良地质作用" 且含 "未发现" 或 "崩塌")
+            buried_text:        不利埋藏物 (触发: "不利埋藏物" 或 "埋藏的河道")
+        """
+        sc = self.config.get_site_conditions()
+        if not sc:
+            return
+
+        # 高程统计 (自动注入)
+        bh_info = self.data.get("borehole_info", {})
+        elv_min = fmt_val(bh_info.get("elv_min"))
+        elv_max = fmt_val(bh_info.get("elv_max"))
+
+        # 液化自动判断
+        liq_data, liq_liq, liq_non = self.data.get("liquefaction", ([], 0, 0))
+        if liq_liq > 0:
+            auto_liq_short = "存在液化"
+        elif liq_data:
+            auto_liq_short = "不液化"
+        else:
+            auto_liq_short = "未揭露液化土层"
+
+        # 占位符变量
+        fmt_vars: Dict[str, str] = {
+            "elv_min": elv_min,
+            "elv_max": elv_max,
+            "liquefaction_result": auto_liq_short,
+        }
+
+        # 触发词 → 配置键映射
+        triggers: List[Tuple[List[str], str]] = [
+            (["地貌单元", "所处地貌"], "terrain_text"),
+            (["地形地势", "钻孔孔口高程"], "topography_text"),
+            (["建筑红线", "场区周边环境", "周边环境"], "environment_text"),
+            (["地表水体", "地表水"], "surface_water_text"),
+            (["地震设计基本参数", "设计基本地震动"], "seismic_params_text"),
+            (["等效剪切波速", "场地类别判定"], "site_class_text"),
+            (["地震稳定性"], "seismic_stability_text"),
+            (["抗震地段"], "seismic_zone_text"),
+            (["软土震陷", "震陷判别"], "soft_soil_text"),
+            (["不良地质作用"], "adverse_text"),
+            (["不利埋藏物", "埋藏的河道"], "buried_text"),
+        ]
+
+        replaced_count = 0
+        for p in self.doc.paragraphs:
+            txt = p.text.strip()
+            if not txt:
+                continue
+
+            for keywords, config_key in triggers:
+                config_text = sc.get(config_key, "")
+                if not config_text:
+                    continue
+                if any(kw in txt for kw in keywords):
+                    try:
+                        filled = config_text.format(**fmt_vars)
+                    except KeyError:
+                        filled = config_text
+                    set_para_text(p, filled)
+                    replaced_count += 1
+                    break
+
+        if replaced_count:
+            logger.info(f"  场地条件: 替换 {replaced_count} 段")
+        else:
+            logger.debug("  场地条件: 未找到匹配段落")
 
     # ---- 场地稳定性及适宜性评价 (CJJ57-2012) ----
 

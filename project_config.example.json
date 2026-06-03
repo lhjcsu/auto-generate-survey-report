@@ -5,6 +5,20 @@
   "template": "25019威海高区保税物流中心.docx",
   "output_suffix": "_正式报告",
 
+  "_comment_project_overview": "第一章 拟建工程概况: commission_text 支持占位符 {client} {project_name} {survey_stage}",
+  "project_overview": {
+    "client": "威海辰西置业有限公司",
+    "survey_stage": "详细勘察",
+    "commission_text": "受{client}的委托，我单位承担了其拟建{project_name}{survey_stage}阶段的岩土工程勘察工作。",
+    "site_location": "勘察场地位于威海一中对面，文化中路南，古寨西路东。",
+    "building_desc": "本次勘察建筑物包括21栋11F和17F住宅楼，南北2栋地下车库，北侧和东西2侧有1-3层临街商业及附属用房，总建筑面积221077.78m2，其中地下建筑面积66450.08m2，建筑物特征一览表见表1-1。",
+    "importance_level": "二级",
+    "site_complexity": "二级",
+    "foundation_grade": "一级",
+    "survey_grade": "甲级",
+    "frozen_depth": "0.50m"
+  },
+
   "_comment_table_indices": "docx 中表格的序号索引 (从 0 开始), 不同模板可能需要调整",
   "table_indices": {
     "buildings": 2,
@@ -139,6 +153,21 @@
     "5": { "name": "中细砂", "default_result": "不液化" },
     "7": { "name": "中粗砂", "default_result": "不液化" },
     "9": { "name": "中粗砂", "default_result": "不液化" }
+  },
+
+  "_comment_site_conditions": "第五章 场地条件: 各子节文字配置, 支持占位符 {elv_min} {elv_max} {liquefaction_result}",
+  "site_conditions": {
+    "terrain_text": "勘察场地位于胶东半岛低山丘陵区，所处地貌单元为丘陵。",
+    "topography_text": "拟建场地整体地形地势南高北低，东西高中间低。地面标高最大值{elv_max}m,最小值{elv_min}m,地表相对高差较大(根据钻孔统计)。",
+    "environment_text": "拟建场区东南西北侧为现状道路，南侧距离建筑红线约15m，北侧距离建筑红线约32.5m，东侧距离建筑红线约15.2m，西侧距离建筑红线约20m。",
+    "surface_water_text": "拟建场地及附近无大的地表水体。",
+    "seismic_params_text": "拟建场地按《中国地震动参数区划图》(GB18306-2015)附录C，II类场地设计基本地震动峰值加速度为0.10g、设计基本地震动峰值加速度反应谱特征周期0.35s。根据《建筑与市政工程抗震通用规范》(GB55002-2021)2.2.2，对应的抗震设防烈度为7度、设计地震分组为第三组。",
+    "site_class_text": "经场地现场测试，建议场地整体按Ⅱ类场地考虑，设计特征周期0.35s。",
+    "seismic_stability_text": "场地不存在地震时发生液化、震陷、横向扩展、崩塌及滑坡等的可能，地震稳定性较好。",
+    "seismic_zone_text": "本场地不属于稳定基岩、坚硬土及开阔、平坦、密实、均匀的中硬土，不存在地震时发生滑坡、崩塌、地陷、地裂、泥石流及发震断裂带等不良地质作用的可能，无液化及软土震陷，建议按对建筑抗震一般地段考虑。",
+    "soft_soil_text": "场地地层深度内未揭露软土。",
+    "adverse_text": "场区内未发现崩塌、滑坡、泥石流、岩溶等不良地质作用发生的可能性。",
+    "buried_text": "通过现场踏勘、搜集资料调查走访及钻探工作，场区内无古河道、暗浜、暗塘、洞穴或其他地下设施等不利埋藏物。"
   },
 
   "_comment_site_evaluation": "场地稳定性及适宜性评价 (CJJ57-2012): paragraphs=段落模板数组, 可用占位符: {liquefaction_text} {corrosion_text} {adverse_geology} {buried_objects} {seismic_section} {stability_grade} {suitability_grade} {suitability_text}",
