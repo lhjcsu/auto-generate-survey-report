@@ -156,6 +156,20 @@
     ]
   },
 
+  "_comment_foundation_evaluation": "地基评价 (4.5.7 §2均匀性/§5软弱下卧层/§6变形参数): paragraphs=段落模板数组, 可用占位符: {uniformity_text} {weak_layer_text} {deformation_text} {bearing_layer} {bearing_fak}",
+  "foundation_evaluation": {
+    "uniformity_text": "拟建场地地基土为不均匀地基，各土层分布变化较大，厚度变化较大，地基土均匀性较差。",
+    "weak_layer_text": "场地内局部分布3层淤泥质粉质黏土（fak=70kPa），承载力较低，作为软弱下卧层需进行验算，建议按《建筑地基基础设计规范》(GB 50007-2011)第5.2.7条进行软弱下卧层验算。",
+    "deformation_text": "各土层压缩模量（Es）详见承载力建议值表，建议按《建筑地基基础设计规范》(GB 50007-2011)进行地基变形计算。",
+    "bearing_layer": "7层中粗砂",
+    "bearing_fak": "280kPa",
+    "paragraphs": [
+      "{uniformity_text}",
+      "{weak_layer_text}",
+      "{deformation_text}"
+    ]
+  },
+
   "_comment_technical_standards": "技术标准配置: always=始终包含, conditional=按条件包含, condition可选值: has_rock_layers/has_rock_samples/has_water_samples/has_pile_foundation/has_basement/always",
   "technical_standards": {
     "always": [

@@ -442,6 +442,10 @@ class ProjectConfig:
         """获取场地稳定性及适宜性评价配置"""
         return self.raw.get("site_evaluation", {})
 
+    def get_foundation_evaluation(self) -> Dict[str, Any]:
+        """获取地基评价配置 (4.5.7 §2 均匀性 / §5 软弱下卧层 / §6 变形参数)"""
+        return self.raw.get("foundation_evaluation", {})
+
 
 # ============================================================
 # 数据加载器
@@ -1001,6 +1005,7 @@ class ReportFiller:
         self._fill_foundation_tables()
         self._fill_conclusion()
         self._fill_site_evaluation()
+        self._fill_foundation_evaluation()
         self._fill_standards()
         self._apply_date_replacements()
 
@@ -1632,6 +1637,179 @@ class ReportFiller:
             )
         else:
             logger.debug("  场地评价: 未找到匹配段落，跳过")
+
+    # ---- 地基评价 (4.5.7 §2 均匀性 / §5 软弱下卧层 / §6 变形参数) ----
+
+    def _fill_foundation_evaluation(self) -> None:
+        """根据配置和数据生成地基评价段落"""
+        eval_config = self.config.get_foundation_evaluation()
+        if not eval_config:
+            return
+
+        paragraphs = eval_config.get("paragraphs", [])
+        if not paragraphs:
+            return
+
+        # --- 自动数据收集 ---
+        layer_stats = self.data.get("layers", {})
+        bearing_config = {
+            lid: self.config.get_bearing_values(lid)
+            for lid in self.layer_ids
+        }
+
+        # §2 地基均匀性: 根据各层厚度变异系数判断
+        auto_uniformity = self._auto_uniformity_text(layer_stats)
+
+        # §5 软弱下卧层: 找出低承载力层
+        auto_weak_layer = self._auto_weak_layer_text(bearing_config)
+
+        # §6 变形计算参数: 引用 T18 表 Es 值
+        bearing_idx = self.ti.get("bearing_capacity", 18)
+        table_ref = f"表{bearing_idx}" if bearing_idx else "承载力建议值表"
+        auto_deformation = (
+            f"各土层压缩模量（Es）详见{table_ref}，"
+            f"建议按《建筑地基基础设计规范》(GB 50007-2011)进行地基变形计算。"
+        )
+
+        # 准备占位符: 优先使用配置值，否则使用自动生成值
+        placeholders: Dict[str, str] = {
+            "uniformity_text": eval_config.get("uniformity_text", auto_uniformity),
+            "weak_layer_text": eval_config.get("weak_layer_text", auto_weak_layer),
+            "deformation_text": eval_config.get("deformation_text", auto_deformation),
+        }
+
+        # 附加占位符: 持力层信息
+        bearing_layer = eval_config.get("bearing_layer", "")
+        bearing_fak = eval_config.get("bearing_fak", "")
+        placeholders["bearing_layer"] = bearing_layer
+        placeholders["bearing_fak"] = bearing_fak
+
+        # 格式化段落
+        formatted: List[str] = []
+        for tpl in paragraphs:
+            try:
+                text = tpl.format(**placeholders)
+            except KeyError:
+                text = tpl
+            formatted.append(text)
+
+        # 在模板中定位触发关键词段落并替换
+        trigger_keywords = [
+            "地基均匀性", "天然地基评价", "软弱下卧层",
+            "地基评价", "地基土评价", "地基均匀",
+        ]
+
+        replaced = False
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if any(kw in txt for kw in trigger_keywords):
+                # 首段替换
+                set_para_text(p, formatted[0])
+                # 后续段落
+                for j, ftext in enumerate(formatted[1:], start=1):
+                    target_idx = i + j
+                    if target_idx < len(self.doc.paragraphs):
+                        next_txt = self.doc.paragraphs[target_idx].text.strip()
+                        # 如果下一段是相关段落（非新章节标题），替换
+                        if next_txt and not any(
+                            kw in next_txt for kw in (
+                                "结论", "建议", "技术标准", "勘察依据",
+                                "场地稳定性", "地下水", "基坑",
+                            )
+                        ):
+                            set_para_text(
+                                self.doc.paragraphs[target_idx], ftext
+                            )
+                        else:
+                            # 模板段落不够，追加到当前段
+                            prev_p = self.doc.paragraphs[target_idx - 1]
+                            old = prev_p.text.rstrip()
+                            set_para_text(prev_p, old + "\n" + ftext)
+                    else:
+                        # 模板段落不足，追加到最后一段
+                        last_p = self.doc.paragraphs[len(self.doc.paragraphs) - 1]
+                        old = last_p.text.rstrip()
+                        set_para_text(last_p, old + "\n" + ftext)
+                replaced = True
+                break
+
+        if replaced:
+            logger.info("  地基评价: 已填充 %d 段", len(formatted))
+        else:
+            logger.debug("  地基评价: 未找到匹配段落，跳过")
+
+    def _auto_uniformity_text(
+        self, layer_stats: Dict[str, Dict[str, Any]]
+    ) -> str:
+        """根据各层厚度变异系数自动判断地基均匀性"""
+        if not layer_stats or not self.layer_ids:
+            return "地基土均匀性需根据实际勘探资料判定。"
+
+        # 计算各层厚度变异系数 (CV of thickness)
+        cvs: List[float] = []
+        for lid in self.layer_ids:
+            ls = layer_stats.get(lid, {})
+            thk_avg = ls.get("thick_avg")
+            thk_min = ls.get("thick_min")
+            thk_max = ls.get("thick_max")
+            if thk_avg and thk_min is not None and thk_max is not None and thk_avg > 0:
+                # 近似变异系数 = (max - min) / avg
+                cv = (thk_max - thk_min) / thk_avg
+                cvs.append(cv)
+
+        if not cvs:
+            return "地基土均匀性需根据实际勘探资料判定。"
+
+        avg_cv = sum(cvs) / len(cvs)
+        max_cv = max(cvs)
+
+        if max_cv < 0.3:
+            return (
+                "拟建场地地基土为均匀地基，各土层分布较稳定，"
+                "厚度变化较小，地基土均匀性较好。"
+            )
+        elif max_cv < 0.5:
+            return (
+                "拟建场地地基土为较均匀地基，各土层分布有一定变化，"
+                "厚度变化一般，地基土均匀性一般。"
+            )
+        else:
+            return (
+                "拟建场地地基土为不均匀地基，各土层分布变化较大，"
+                "厚度变化较大，地基土均匀性较差。"
+            )
+
+    def _auto_weak_layer_text(
+        self, bearing_config: Dict[str, Optional[Dict[str, str]]]
+    ) -> str:
+        """自动检测软弱下卧层（承载力 < 100 kPa 的土层）"""
+        weak_layers: List[Tuple[str, str, str]] = []  # (层号, 名称, fak)
+
+        for lid in self.layer_ids:
+            bc = bearing_config.get(lid)
+            if not bc:
+                continue
+            fak_str = bc.get("fak", "")
+            fak = safe_float(fak_str)
+            if fak is not None and fak < 100 and fak > 0:
+                name = self.layer_names.get(lid, "")
+                weak_layers.append((lid, name, str(int(fak))))
+
+        if weak_layers:
+            desc_parts = []
+            for lid, name, fak in weak_layers:
+                desc_parts.append(f"{lid}层{name}（fak={fak}kPa）")
+            layers_desc = "、".join(desc_parts)
+            return (
+                f"场地内局部分布{layers_desc}，承载力较低，"
+                f"作为软弱下卧层需进行验算，"
+                f"建议按《建筑地基基础设计规范》(GB 50007-2011)第5.2.7条进行软弱下卧层验算。"
+            )
+        else:
+            return (
+                "场地内未发现明显的软弱下卧层，"
+                "各土层承载力可满足一般建筑天然地基要求。"
+            )
 
     # ---- 技术标准列表 (配置驱动 + 条件过滤) ----
 
