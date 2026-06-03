@@ -6,7 +6,11 @@
 |------|------|------|--------|--------|
 | 一 工程概况 | 委托/场地/建筑/勘察等级/冻结深度 | ✅ | 5c898e0 | `project_overview` |
 | 二 勘察目的 | 任务要求条件过滤 (基坑条目) | ✅ | b7ef083 | `project_overview.has_basement` |
-| 三 工作概述 | 工作量表+钻孔类型 (已有) | ✅ | - | `borehole_type_names` |
+| 三(一) 勘察方法 | N63.5动力触探/波速测试 条件过滤 | ✅ | 642539c | 自动检测 (n63_total/建筑高度>24m) |
+| 三(二) 工作布置 | 布孔/孔深/水样 段落 (已有) | ✅ | - | `borehole_info` 自动注入 |
+| 三(四) 完成情况 | 工作量统计表 + 完成段落 (已有) | ✅ | - | `borehole_info` 自动注入 |
+| 三(五) 质量评述 | 勘察等级自动替换 (甲/乙/丙级) | ✅ | 642539c | `project_overview.survey_grade` |
+| 三 其余段落 | 工艺描述/工作进度/坐标系 → 模板保留, 手动改 | — | - | - |
 | 四 气象/地质 | 标准冻结深度注入 | ✅ | 5c898e0 | `project_overview.frozen_depth` |
 | 五 场地条件 | 地形/地下水/地震/不良地质 (11段) | ✅ | 5c898e0 | `site_conditions` |
 | 六(一) | 岩土层逐层工程评价 | ✅ | 69a02ab | `analysis_evaluation.layer_eval` |
@@ -27,6 +31,17 @@
 | 七(一) | 结论 (自动占位符+配置段落) | ✅ | 79a61d4 | `conclusion_suggestions.conclusion` |
 | 七(二) | 建议 (12条配置段落) | ✅ | 79a61d4 | `conclusion_suggestions.suggestions` |
 | 技术标准 | 配置驱动+条件过滤 | ✅ | d1ab318 | `technical_standards` |
+
+## 条件过滤逻辑汇总
+
+| 条件 | 检测方式 | 影响范围 |
+|------|---------|---------|
+| `has_basement` | 建筑物数据含"地下" 或 `project_overview.has_basement` | 第二章: 删除基坑任务条目并重编号 |
+| `has_basement` | 同上 | 第六章: 清空基坑开挖(九)+工程风险(十)段落 |
+| N63.5 | `borehole_info.n63_total > 0` | 第三章: 删除动力触探方法段落 |
+| 高层建筑 | 任一建筑物高度 > 24m (正则提取数字) | 第三章: 删除波速测试方法段落 |
+| 液化 | 标贯数据自动判别 | 六(三)/七(一): 注入液化结论文字 |
+| 岩层/岩样/水样/桩基 | 数据自动检测 | 技术标准: 条件包含对应规范 |
 
 ## 配置结构总览
 
@@ -53,14 +68,8 @@
   },
   "analysis_evaluation": {
     "layer_eval": { "1": "...", "2": "...", "5-1": "..." },
-    "anti_float": ["段落1", "段落2", "..."],
-    "foundation_text": ["..."],
-    "pile_eval": ["..."],
-    "special_soils": ["..."],
-    "stability": ["..."],
-    "excavation": ["..."],
-    "risk": ["..."],
-    "deformation": ["..."]
+    "anti_float, foundation_text, pile_eval, special_soils": ["段落..."],
+    "stability, excavation, risk, deformation": ["段落..."]
   },
   "conclusion_suggestions": {
     "conclusion": ["1、...", "2、...", "..."],
@@ -73,13 +82,13 @@
 }
 ```
 
-## fill_all() 执行顺序 (18步)
+## fill_all() 执行顺序 (20步)
 
 1. `_global_replace()` — 全局文本替换
 2. `_fill_project_overview()` — 第一章: 工程概况
 3. `_fill_survey_purpose()` — 第二章: 任务要求条件过滤
 4. `_fill_buildings_table()` — 建筑物特征表
-5. `_fill_workload()` — 工作量表
+5. `_fill_workload()` — 第三章: 工作量表 + 条件过滤(N63.5/波速) + 勘察等级
 6. `_fill_water_level()` — 水位表
 7. `_fill_layer_descriptions()` — 地层描述
 8. `_fill_phys_spt_tables()` — 物理力学表
@@ -96,7 +105,7 @@
 19. `_fill_standards()` — 技术标准列表
 20. `_apply_date_replacements()` — 日期替换
 
-## 提交历史 (8次提交)
+## 提交历史 (11次提交)
 
 | commit | 描述 |
 |--------|------|
@@ -108,6 +117,8 @@
 | b7ef083 | 第二章任务要求条件过滤 |
 | 69a02ab | 第六章分析评价9个子节 |
 | 79a61d4 | 第七章结论与建议 |
+| a2814fd | 更新进度文档 |
+| 642539c | 第三章: N63.5/波速条件过滤 + 勘察等级注入 |
 
 ## 待优化项目
 
