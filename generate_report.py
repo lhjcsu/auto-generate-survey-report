@@ -1001,8 +1001,9 @@ class ReportFiller:
         logger.info("=" * 60)
 
         self._global_replace()
-        self._fill_project_overview()
-        self._fill_buildings_table()
+        self._fill_project_overview()       # 1. 第一章: 拟建工程概况
+        self._fill_survey_purpose()         # 2. 第二章: 勘察目的条件过滤
+        self._fill_buildings_table()        # 3. 建筑物特征表
         self._fill_workload()
         self._fill_water_level()
         self._fill_layer_descriptions()
@@ -1133,6 +1134,64 @@ class ReportFiller:
             logger.info(f"  工程概况: 替换 {replaced_count} 段")
         else:
             logger.debug("  工程概况: 未找到匹配段落")
+
+    # ---- 勘察目的 / 任务要求条件过滤 (第二章) ----
+
+    def _fill_survey_purpose(self) -> None:
+        """根据条件过滤勘察目的/任务要求条目（第二章）
+
+        当无地下室 (has_basement=False) 时，删除含"基坑开挖"的条目并重新编号。
+        可通过配置 project_overview.has_basement 显式控制。
+        """
+        overview = self.config.get_project_overview()
+        if not overview:
+            return
+
+        # has_basement 判断: 优先取配置显式值, 否则从建筑物数据自动检测
+        conditions = self._evaluate_standard_conditions()
+        has_basement = overview.get("has_basement", conditions.get("has_basement", False))
+
+        if has_basement:
+            return  # 有地下室/基坑, 全部保留
+
+        # 条件关键词: 包含此关键词的条目在条件不满足时删除
+        cond_keyword = "基坑开挖"
+
+        # 收集编号条目: [(para_index, item_number)]
+        numbered_items: List[Tuple[int, int]] = []
+        removed_indices: List[int] = []
+        num_idx = 1
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if not txt:
+                continue
+            prefix = f"{num_idx}."
+            if txt.startswith(prefix):
+                if cond_keyword in txt:
+                    removed_indices.append(i)
+                    # 仍加入列表以便后续重编号 (最终会被清空)
+                    numbered_items.append((i, num_idx))
+                else:
+                    numbered_items.append((i, num_idx))
+                num_idx += 1
+
+        if not removed_indices:
+            return
+
+        # 清空需要删除的段落
+        for idx in removed_indices:
+            set_para_text(self.doc.paragraphs[idx], "")
+
+        # 重新编号: 剩余条目按顺序 1,2,3...
+        remaining = [(idx, n) for idx, n in numbered_items if idx not in removed_indices]
+        for seq, (idx, old_num) in enumerate(remaining, 1):
+            p = self.doc.paragraphs[idx]
+            old_prefix = f"{old_num}."
+            new_prefix = f"{seq}."
+            new_text = new_prefix + p.text.strip()[len(old_prefix):]
+            set_para_text(p, new_text)
+
+        logger.info(f"  勘察目的: 删除基坑相关条目 {len(removed_indices)} 条, 重编号 {len(remaining)} 条")
 
     # ---- 建筑物特征表 ----
 

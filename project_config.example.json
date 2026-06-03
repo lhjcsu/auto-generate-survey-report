@@ -16,7 +16,9 @@
     "site_complexity": "二级",
     "foundation_grade": "一级",
     "survey_grade": "甲级",
-    "frozen_depth": "0.50m"
+    "frozen_depth": "0.50m",
+    "_comment_has_basement": "是否有地下室/基坑 (影响任务要求和基坑章节), 不填则从建筑物数据自动检测",
+    "has_basement": true
   },
 
   "_comment_table_indices": "docx 中表格的序号索引 (从 0 开始), 不同模板可能需要调整",
