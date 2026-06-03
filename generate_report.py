@@ -438,6 +438,10 @@ class ProjectConfig:
         """获取技术标准配置"""
         return self.raw.get("technical_standards", {})
 
+    def get_site_evaluation(self) -> Dict[str, Any]:
+        """获取场地稳定性及适宜性评价配置"""
+        return self.raw.get("site_evaluation", {})
+
 
 # ============================================================
 # 数据加载器
@@ -996,6 +1000,7 @@ class ReportFiller:
         self._fill_liquefaction()
         self._fill_foundation_tables()
         self._fill_conclusion()
+        self._fill_site_evaluation()
         self._fill_standards()
         self._apply_date_replacements()
 
@@ -1524,6 +1529,109 @@ class ReportFiller:
                     f"钻孔孔口高程{bh_info['elv_min']:.2f}～{bh_info['elv_max']:.2f}m"
                     f"(根据钻孔统计)。"
                 ))
+
+    # ---- 场地稳定性及适宜性评价 (CJJ57-2012) ----
+
+    def _fill_site_evaluation(self) -> None:
+        """根据配置和实际数据生成场地稳定性及适宜性评价段落"""
+        eval_config = self.config.get_site_evaluation()
+        if not eval_config:
+            return
+
+        paragraphs = eval_config.get("paragraphs", [])
+        if not paragraphs:
+            return
+
+        # 从数据自动生成液化文本
+        liq_data, liq_liq, liq_non = self.data.get("liquefaction", ([], 0, 0))
+        if liq_liq > 0:
+            auto_liq = f"场地饱和砂土层存在液化（液化等级轻微）"
+        elif liq_data:
+            auto_liq = "场地饱和砂土层均不液化"
+        else:
+            auto_liq = "场地未揭露液化土层"
+
+        # 从腐蚀性评价自动获取文本
+        water_samples = self.data.get("water_samples", [])
+        salt_samples = self.data.get("salt_samples", [])
+        corr = evaluate_corrosion(water_samples, salt_samples)
+        if corr.get("water"):
+            wc = corr["water"]
+            worst_level = max(
+                wc["II_conc"].values(),
+                key=lambda x: ["微", "弱", "中", "强"].index(x),
+            )
+            auto_corr = f"地下水对混凝土结构具{worst_level}腐蚀性"
+        else:
+            auto_corr = ""
+
+        # 准备占位符变量: 优先使用配置中的值，其次自动生成
+        placeholders = {
+            "liquefaction_text": eval_config.get("liquefaction_text", auto_liq),
+            "corrosion_text": eval_config.get("corrosion_text", auto_corr),
+            "adverse_geology": eval_config.get("adverse_geology", "不良地质作用不发育"),
+            "buried_objects": eval_config.get(
+                "buried_objects",
+                "未发现埋藏的河道、沟浜、墓穴、防空洞、孤石等对工程不利的埋藏物",
+            ),
+            "seismic_section": eval_config.get("seismic_section", "对建筑抗震一般地段"),
+            "stability_grade": eval_config.get("stability_grade", "基本稳定"),
+            "suitability_grade": eval_config.get("suitability_grade", "较适宜"),
+            "suitability_text": eval_config.get("suitability_text", ""),
+        }
+
+        # 格式化各段落
+        formatted: List[str] = []
+        for tpl in paragraphs:
+            try:
+                text = tpl.format(**placeholders)
+            except KeyError:
+                text = tpl  # 未定义的占位符保留原文
+            formatted.append(text)
+
+        # 在模板中定位并替换: 找到包含触发关键词的首段，替换后续段
+        trigger_keywords = [
+            "场地稳定性", "稳定性评价", "适宜性评价",
+            "场地稳定性及适宜性", "稳定性和适宜性",
+        ]
+
+        replaced = False
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if any(kw in txt for kw in trigger_keywords):
+                # 首段替换为格式化后的第一段
+                set_para_text(p, formatted[0])
+                # 后续配置段落: 尝试替换模板中的后续段落
+                for j, ftext in enumerate(formatted[1:], start=1):
+                    target_idx = i + j
+                    if target_idx < len(self.doc.paragraphs):
+                        next_txt = self.doc.paragraphs[target_idx].text.strip()
+                        # 如果下一段是相关段落（非新章节），替换它
+                        if next_txt and not any(
+                            kw in next_txt
+                            for kw in ("结论", "建议", "技术标准", "勘察依据", "地基基础")
+                        ):
+                            set_para_text(self.doc.paragraphs[target_idx], ftext)
+                        else:
+                            # 模板段落不够，剩余文本追加到上一段末尾
+                            prev_p = self.doc.paragraphs[target_idx - 1]
+                            old_text = prev_p.text.rstrip()
+                            set_para_text(prev_p, old_text + "\n" + ftext)
+                    else:
+                        # 模板段落不足，追加到最后一段
+                        last_p = self.doc.paragraphs[len(self.doc.paragraphs) - 1]
+                        old_text = last_p.text.rstrip()
+                        set_para_text(last_p, old_text + "\n" + ftext)
+                replaced = True
+                break
+
+        if replaced:
+            logger.info(
+                f"  场地评价: {placeholders['stability_grade']} / "
+                f"{placeholders['suitability_grade']}"
+            )
+        else:
+            logger.debug("  场地评价: 未找到匹配段落，跳过")
 
     # ---- 技术标准列表 (配置驱动 + 条件过滤) ----
 

@@ -141,6 +141,21 @@
     "9": { "name": "中粗砂", "default_result": "不液化" }
   },
 
+  "_comment_site_evaluation": "场地稳定性及适宜性评价 (CJJ57-2012): paragraphs=段落模板数组, 可用占位符: {liquefaction_text} {corrosion_text} {adverse_geology} {buried_objects} {seismic_section} {stability_grade} {suitability_grade} {suitability_text}",
+  "site_evaluation": {
+    "adverse_geology": "滑坡、崩塌和泥石流等不良地质作用不发育",
+    "buried_objects": "未发现埋藏的河道、沟浜、墓穴、防空洞、孤石等对工程不利的埋藏物",
+    "seismic_section": "对建筑抗震一般地段",
+    "stability_grade": "基本稳定",
+    "suitability_grade": "较适宜",
+    "suitability_text": "场地基本稳定，地形有一定起伏，岩土种类较多，分布较不均匀，地基条件和施工条件一般，基础工程费用较低，工程建设采用一般防护措施，不需进行地质灾害治理，",
+    "paragraphs": [
+      "依据区域地质资料分析，拟建场地所处大地构造背景稳定，第四纪以来未发现新构造运动迹象，{adverse_geology}，勘察过程中勘探点位置勘察深度范围内{buried_objects}，{liquefaction_text}。",
+      "按《城乡规划工程地质勘察规范》(CJJ57-2012)第8.2.1条：拟建场地{seismic_section}，{adverse_geology}，划分为{stability_grade}场地。",
+      "按《城乡规划工程地质勘察规范》(CJJ57-2012)附录C：{suitability_text}划分为工程建设适宜性{suitability_grade}。"
+    ]
+  },
+
   "_comment_technical_standards": "技术标准配置: always=始终包含, conditional=按条件包含, condition可选值: has_rock_layers/has_rock_samples/has_water_samples/has_pile_foundation/has_basement/always",
   "technical_standards": {
     "always": [
