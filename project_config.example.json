@@ -21,6 +21,17 @@
     "has_basement": true
   },
 
+  "_comment_hn_db": "华宁勘察数据库: 读取 ZHMS/DCSH/BG/TY/DCSJ 原始数据文件, 用于动态生成第五章(二)地层描述",
+  "hn_db_dir": "D:\\2025\\城投文化中路住宅项目\\sj",
+  "hn_project_code": "17",
+  "geo_age_names": {
+    "_comment": "地质年代名称覆盖 (group_key → 显示名称), 不填则自动生成",
+    "N": "新元古界荣成序列威海单元（NhηγRw）",
+    "Q4|ml": "第四系人工堆积层（Q4ml）",
+    "Q4|al+pl": "第四系冲洪积层（Q4al+pl）",
+    "Q4|dl+el": "第四系残积层（Q4el）"
+  },
+
   "_comment_table_indices": "docx 中表格的序号索引 (从 0 开始), 不同模板可能需要调整",
   "table_indices": {
     "buildings": 2,

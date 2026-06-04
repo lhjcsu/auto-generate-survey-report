@@ -13,6 +13,7 @@
 | 三 其余段落 | 工艺描述/工作进度/坐标系 → 模板保留, 手动改 | — | - | - |
 | 四 气象/地质 | 标准冻结深度注入 | ✅ | 5c898e0 | `project_overview.frozen_depth` |
 | 五 场地条件 | 地形/地下水/地震/不良地质 (11段) | ✅ | 5c898e0 | `site_conditions` |
+| 五(二) 地层描述 | 华宁数据库动态生成 (ZHMS/DCSH) | ✅ NEW | - | `hn_db_dir` + `geo_age_names` |
 | 六(一) | 岩土层逐层工程评价 | ✅ | 69a02ab | `analysis_evaluation.layer_eval` |
 | 六(二) | 参数建议值表 (已有 T18) | ✅ | - | `bearing_values` |
 | 六(三) | 场地稳定性及适宜性 (已有) | ✅ | ae3c1fb | `site_evaluation` |
@@ -53,6 +54,12 @@
     "frozen_depth": "0.50m",
     "has_basement": true
   },
+  "hn_db_dir": "D:\\...\\sj",
+  "hn_project_code": "17",
+  "geo_age_names": {
+    "N": "新元古界荣成序列威海单元（NhηγRw）",
+    "Q4|ml": "第四系人工堆积层（Q4ml）"
+  },
   "site_conditions": {
     "terrain_text, topography_text, environment_text, surface_water_text": "...",
     "seismic_params_text, site_class_text, seismic_stability_text": "...",
@@ -90,7 +97,7 @@
 4. `_fill_buildings_table()` — 建筑物特征表
 5. `_fill_workload()` — 第三章: 工作量表 + 条件过滤(N63.5/波速) + 勘察等级
 6. `_fill_water_level()` — 水位表
-7. `_fill_layer_descriptions()` — 地层描述
+7. `_fill_layer_descriptions()` — 地层描述 (华宁数据库模式/回退模板模式)
 8. `_fill_phys_spt_tables()` — 物理力学表
 9. `_fill_bearing_capacity()` — 承载力表
 10. `_fill_water_salt_tables()` — 水样/盐样表
@@ -105,7 +112,7 @@
 19. `_fill_standards()` — 技术标准列表
 20. `_apply_date_replacements()` — 日期替换
 
-## 提交历史 (11次提交)
+## 提交历史 (12次提交)
 
 | commit | 描述 |
 |--------|------|
@@ -119,9 +126,50 @@
 | 79a61d4 | 第七章结论与建议 |
 | a2814fd | 更新进度文档 |
 | 642539c | 第三章: N63.5/波速条件过滤 + 勘察等级注入 |
+| NEW | 华宁数据库读取器 + 第五章(二)地层描述动态生成 |
+
+## 华宁数据库读取器 (HuaNingDBReader) — NEW
+
+### 概述
+直接读取华宁HNCAD勘察软件原始数据库文件，动态生成第五章(二)岩土结构及工程特性段落。
+解决了之前依赖模板段落匹配导致不同项目地层不对应的问题。
+
+### 读取的文件
+
+| 文件 | 内容 | 编码 |
+|------|------|------|
+| `ZHMS.{code}` | 地层描述 (层号,岩土名:描述) | GB2312 |
+| `DCSH.{code}` | 地层序列+地质年代 (层号,岩性代码,,,成因,年代) | GB2312 |
+| `DCSJ.{code}` | 逐孔地层 (孔号,层号,层底深度) 最后层无深度=未穿透 | GB2312 |
+| `BG.{code}` | 标贯数据 (孔号,起始深度,终止深度,N值) | GB2312 |
+| `TY.{code}` | 取样数据 (孔号,深度,类型: 0=扰动/1=原状/2=岩样) | GB2312 |
+
+### 动态生成流程
+
+1. 从 ZHMS 读取每层岩土名称和描述
+2. 从 DCSH 读取地质年代分组 (Q4ml → Q4al+pl → Q4dl+el → 基岩N)
+3. 从 DCSJ 检测未穿透层 (最后一层无深度) 和最大揭露厚度
+4. 从 BG 统计每层标贯次数 (用DCSJ层底深度定位所属层)
+5. 从 TY 统计每层取样数量 (扰动样/原状样)
+6. 用 XML addnext() 在(二)节标题后动态插入:
+   - 加粗的地质年代标题 (如 "第四系人工堆积层（Q4ml）")
+   - 每层: 地层描述段落 + 试验信息段落 + 表标题段落
+   - 收尾段落
+
+### 配置项
+
+- `hn_db_dir`: 华宁数据库目录路径
+- `hn_project_code`: 项目代码 (或自动检测)
+- `geo_age_names`: 地质年代名称覆盖 (用于基岩等复杂名称)
+
+### 回退机制
+未配置 `hn_db_dir` 时自动回退到模板匹配模式 (`_fill_layer_descriptions_fallback`)
 
 ## 待优化项目
 
+- 五(二) 试验信息段落: 标贯/取样数量与华宁简报核对 (层边界定位精度)
+- 五(二) 岩石质量段落: 需从配置或岩体力学数据生成 (坚硬程度/完整程度/质量等级)
+- 五(二) 物理力学表: 动态表格插入 (当前依赖模板固定表格)
 - 第六章表7-1 (结论参数表) 自动填充 — 目前需工程师手动填写
 - 地基基础评价总纲 (4.5.6) — 天然地基/桩基/地基处理方案建议细化
 - 坐标系统和高程系统说明 (4.2.6§8) — 配置项

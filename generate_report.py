@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import json
 import logging
@@ -40,6 +41,8 @@ try:
     import openpyxl
     import xlrd
     from docx import Document
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
 except ImportError:
     # 仅在真正需要使用时才报错
     openpyxl = None  # type: ignore[assignment]
@@ -461,6 +464,23 @@ class ProjectConfig:
     def get_conclusion_suggestions(self) -> Dict[str, Any]:
         """获取结论与建议配置 (第七章: conclusion/suggestions 段落数组)"""
         return self.raw.get("conclusion_suggestions", {})
+
+    def get_hn_db_dir(self) -> str:
+        """获取华宁数据库目录 (绝对路径或相对于 base_dir)"""
+        d = self.raw.get("hn_db_dir", "")
+        if d and os.path.isabs(d):
+            return d
+        elif d:
+            return os.path.join(self.base_dir, d)
+        return ""
+
+    def get_geo_age_names(self) -> Dict[str, str]:
+        """获取地质年代名称覆盖配置 {group_key: display_name}"""
+        return self.raw.get("geo_age_names", {})
+
+    def get_hn_project_code(self) -> str:
+        """获取华宁项目代码"""
+        return self.raw.get("hn_project_code", "")
 
 
 # ============================================================
@@ -973,6 +993,498 @@ class SurveyDataLoader:
 
 
 # ============================================================
+# 华宁勘察数据库读取器
+# ============================================================
+
+class HuaNingDBReader:
+    """读取华宁 HNCAD 勘察软件原始数据库文件
+
+    华宁数据库文件命名: FileType.ProjectCode (如 ZHMS.17, DCSH.17)
+    编码: GB2312
+    """
+
+    # 成因代号 → 中文名
+    ORIGIN_NAMES = {
+        "ml": "人工堆积层",
+        "al": "冲积层",
+        "pl": "洪积层",
+        "al+pl": "冲洪积层",
+        "dl": "坡积层",
+        "el": "残积层",
+        "dl+el": "坡残积层",
+        "eol": "风积层",
+        "l": "湖积层",
+        "m": "海积层",
+        "fgl": "冰水沉积层",
+    }
+
+    # 年代代号 → 中文前缀
+    AGE_PREFIXES = {
+        "Q4": "第四系全新统",
+        "Q3": "第四系上更新统",
+        "Q2": "第四系中更新统",
+        "Q1": "第四系下更新统",
+        "N": "新近系",
+        "Nh": "新元古界",
+    }
+
+    # 岩石代码 → 岩石名称 (5位岩性码 = 风化程度2位 + 岩石类型3位)
+    ROCK_TYPE_MAP = {
+        "150": "花岗片麻岩",
+        "151": "花岗岩",
+        "100": "砂岩",
+        "101": "泥岩",
+        "102": "页岩",
+        "103": "石灰岩",
+        "110": "片麻岩",
+        "120": "大理岩",
+        "130": "板岩",
+        "140": "石英岩",
+    }
+
+    # 取样类型代号
+    SAMPLE_TYPE_NAMES = {
+        0: "扰动样",
+        1: "原状样",
+        2: "标贯试样",
+        3: "水样",
+        4: "岩样",
+    }
+
+    def __init__(self, db_dir: str, project_code: str = ""):
+        self.db_dir = db_dir
+        self.project_code = project_code
+        if not project_code and db_dir:
+            self.project_code = self._detect_project_code()
+
+    # ---- 内部工具方法 ----
+
+    def _detect_project_code(self) -> str:
+        """自动检测项目代码"""
+        for f in os.listdir(self.db_dir):
+            if "." in f and f.upper().startswith("ZHMS"):
+                return f.split(".")[-1]
+        for f in os.listdir(self.db_dir):
+            if "." in f and not f.startswith("_") and not f.startswith("."):
+                parts = f.split(".")
+                if len(parts) == 2 and parts[1].isdigit():
+                    return parts[1]
+        return ""
+
+    def _find_file(self, file_type: str) -> Optional[str]:
+        """查找数据库文件 (大小写不敏感)"""
+        target_upper = f"{file_type.upper()}.{self.project_code}"
+        for f in os.listdir(self.db_dir):
+            if f.upper() == target_upper:
+                return os.path.join(self.db_dir, f)
+        # 不区分扩展名
+        for f in os.listdir(self.db_dir):
+            base = f.split(".")[0].upper()
+            if base == file_type.upper() and os.path.isfile(os.path.join(self.db_dir, f)):
+                return os.path.join(self.db_dir, f)
+        return None
+
+    def _read_lines(self, file_type: str) -> List[List[str]]:
+        """读取逗号分隔的数据库文件，自动检测编码"""
+        path = self._find_file(file_type)
+        if not path:
+            return []
+        content = None
+        for enc in ("gb2312", "gbk", "utf-8"):
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        if content is None:
+            logger.warning(f"    无法读取 {file_type}: 编码不支持")
+            return []
+        lines: List[List[str]] = []
+        for line in content.strip().split("\n"):
+            line = line.strip()
+            if line:
+                lines.append(line.split(","))
+        return lines
+
+    # ---- ZHMS: 地层描述 ----
+
+    def read_layer_descriptions(self) -> Dict[str, Dict[str, str]]:
+        """读取 ZHMS 文件 → {layer_id: {name, description}}
+
+        格式: 层号,岩土名:描述内容
+        """
+        lines = self._read_lines("ZHMS")
+        result: Dict[str, Dict[str, str]] = {}
+        for fields in lines:
+            if len(fields) < 2:
+                continue
+            layer_id = fields[0].strip()
+            rest = ",".join(fields[1:])  # 合并可能因逗号分割的内容
+            if layer_id.upper() == "END":
+                break
+            colon_idx = rest.find(":")
+            if colon_idx > 0:
+                name = rest[:colon_idx].strip()
+                desc = rest[colon_idx + 1:].strip()
+            else:
+                name = rest.strip()
+                desc = ""
+            if layer_id and name:
+                result[layer_id] = {"name": name, "description": desc}
+        return result
+
+    # ---- DCSH: 地层序列与地质年代 ----
+
+    def read_layer_sequence(self) -> List[Dict[str, str]]:
+        """读取 DCSH 文件 → 地层序列 (含地质年代和成因)
+
+        格式: 层号,岩性代码,,,成因,年代,
+        """
+        lines = self._read_lines("DCSH")
+        result: List[Dict[str, str]] = []
+        for fields in lines:
+            if len(fields) < 2:
+                continue
+            layer_id = fields[0].strip()
+            if layer_id.upper() == "END":
+                break
+            rock_code = fields[1].strip() if len(fields) > 1 else ""
+            origin = fields[4].strip() if len(fields) > 4 else ""
+            age = fields[5].strip() if len(fields) > 5 else ""
+            if layer_id:
+                result.append({
+                    "layer_id": layer_id,
+                    "rock_code": rock_code,
+                    "origin": origin,
+                    "age": age,
+                })
+        return result
+
+    # ---- DCSJ: 逐孔地层数据 ----
+
+    def read_borehole_layers(self) -> Tuple[
+        Dict[str, List[Dict[str, Any]]],
+        set,
+        Dict[str, float],
+    ]:
+        """读取 DCSJ 文件 → (borehole_layers, unpentrated_ids, max_exposed)
+
+        格式: 孔号,层号,层底深度,
+        最后一层无深度 → 未穿透
+        """
+        lines = self._read_lines("DCSJ")
+        bh_layers: Dict[str, List[Dict[str, Any]]] = {}
+        max_exposed: Dict[str, float] = {}
+        current_bh: Optional[str] = None
+
+        for fields in lines:
+            if not fields:
+                continue
+            bh_id = fields[0].strip() if fields[0].strip() else ""
+            if bh_id and bh_id.upper() != "END":
+                current_bh = bh_id
+            elif bh_id.upper() == "END":
+                break
+            if not current_bh or len(fields) < 2:
+                continue
+
+            layer_id = fields[1].strip()
+            depth_str = fields[2].strip() if len(fields) > 2 else ""
+
+            if current_bh not in bh_layers:
+                bh_layers[current_bh] = []
+
+            depth: Optional[float] = None
+            if depth_str:
+                try:
+                    depth = float(depth_str)
+                except ValueError:
+                    depth = None
+
+            bh_layers[current_bh].append({
+                "layer_id": layer_id,
+                "depth": depth,
+            })
+
+            # 跟踪每层的最大揭露深度
+            if depth is not None:
+                prev = max_exposed.get(layer_id, 0)
+                if depth > prev:
+                    max_exposed[layer_id] = depth
+
+        # 检测未穿透层: 某钻孔最后一层无深度
+        unpentrated: set = set()
+        for bh_id, layers in bh_layers.items():
+            if layers and layers[-1]["depth"] is None:
+                unpentrated.add(layers[-1]["layer_id"])
+
+        return bh_layers, unpentrated, max_exposed
+
+    # ---- BG: 标贯数据 ----
+
+    def read_spt_data(self) -> List[Dict[str, Any]]:
+        """读取 BG 文件 → SPT 数据列表
+
+        格式: 孔号,起始深度,终止深度,N值
+        (孔号为空表示续上一行孔号)
+        """
+        lines = self._read_lines("BG")
+        result: List[Dict[str, Any]] = []
+        current_bh: Optional[str] = None
+
+        for fields in lines:
+            if not fields:
+                continue
+            bh_id = fields[0].strip() if fields[0].strip() else ""
+            if bh_id and bh_id.upper() != "END":
+                current_bh = bh_id
+            elif bh_id.upper() == "END":
+                break
+            if not current_bh or len(fields) < 4:
+                continue
+
+            try:
+                depth_start = float(fields[1])
+                depth_end = float(fields[2])
+                n_value = float(fields[3])
+            except (ValueError, IndexError):
+                continue
+
+            result.append({
+                "borehole_id": current_bh,
+                "depth_start": depth_start,
+                "depth_end": depth_end,
+                "n_value": n_value,
+            })
+
+        return result
+
+    # ---- TY: 取样数据 ----
+
+    def read_sample_data(self) -> List[Dict[str, Any]]:
+        """读取 TY 文件 → 取样数据列表
+
+        格式: 孔号,深度,类型代码
+        类型: 0=扰动样, 1=原状样, 2=标贯试样
+        """
+        lines = self._read_lines("TY")
+        result: List[Dict[str, Any]] = []
+        current_bh: Optional[str] = None
+
+        for fields in lines:
+            if not fields:
+                continue
+            bh_id = fields[0].strip() if fields[0].strip() else ""
+            if bh_id and bh_id.upper() != "END":
+                current_bh = bh_id
+            elif bh_id.upper() == "END":
+                break
+            if not current_bh or len(fields) < 3:
+                continue
+
+            try:
+                depth = float(fields[1])
+                sample_type = int(fields[2])
+            except (ValueError, IndexError):
+                continue
+
+            result.append({
+                "borehole_id": current_bh,
+                "depth": depth,
+                "sample_type": sample_type,
+            })
+
+        return result
+
+    # ---- 数据汇总 ----
+
+    def _assign_to_layer(
+        self,
+        depth: float,
+        layer_boundaries: List[Tuple[str, Optional[float]]],
+    ) -> Optional[str]:
+        """根据深度确定所属地层
+
+        layer_boundaries: [(layer_id, bottom_depth), ...]
+        """
+        prev_depth = 0.0
+        for lid, bdepth in layer_boundaries:
+            if bdepth is None:
+                # 未穿透层, depth 落在该层
+                return lid
+            if depth <= bdepth:
+                return lid
+            prev_depth = bdepth
+        return None
+
+    def compute_spt_counts(
+        self,
+        spt_records: List[Dict[str, Any]],
+        bh_layers: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, int]:
+        """统计每层标贯次数"""
+        counts: Dict[str, int] = defaultdict(int)
+        for rec in spt_records:
+            bh_id = rec["borehole_id"]
+            midpoint = (rec["depth_start"] + rec["depth_end"]) / 2.0
+            boundaries = [
+                (l["layer_id"], l["depth"])
+                for l in bh_layers.get(bh_id, [])
+            ]
+            lid = self._assign_to_layer(midpoint, boundaries)
+            if lid:
+                counts[lid] += 1
+        return dict(counts)
+
+    def compute_sample_counts(
+        self,
+        sample_records: List[Dict[str, Any]],
+        bh_layers: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Dict[int, int]]:
+        """统计每层各类取样数量
+
+        返回: {layer_id: {sample_type_code: count}}
+        """
+        counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        for rec in sample_records:
+            bh_id = rec["borehole_id"]
+            depth = rec["depth"]
+            stype = rec["sample_type"]
+            boundaries = [
+                (l["layer_id"], l["depth"])
+                for l in bh_layers.get(bh_id, [])
+            ]
+            lid = self._assign_to_layer(depth, boundaries)
+            if lid:
+                counts[lid][stype] += 1
+        return {lid: dict(types) for lid, types in counts.items()}
+
+    def build_age_groups(
+        self,
+        layer_sequence: List[Dict[str, str]],
+    ) -> List[Tuple[str, List[str]]]:
+        """构建地质年代分组 (保持 DCSH 顺序)
+
+        返回: [(group_key, [layer_ids]), ...]
+        group_key 格式: "age|origin" 或 "age" (无成因时)
+        """
+        groups: List[Tuple[str, List[str]]] = []
+        current_key: Optional[str] = None
+
+        for rec in layer_sequence:
+            age = rec.get("age", "")
+            origin = rec.get("origin", "")
+            layer_id = rec["layer_id"]
+
+            if origin:
+                key = f"{age}|{origin}"
+            else:
+                key = age
+
+            if key != current_key:
+                groups.append((key, []))
+                current_key = key
+
+            groups[-1][1].append(layer_id)
+
+        return groups
+
+    def build_age_display_name(
+        self,
+        group_key: str,
+        layer_names: Dict[str, str],
+        config_overrides: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """构建地质年代显示名 (如 '第四系人工堆积层（Q4ml）')"""
+        # 先检查配置覆盖
+        if config_overrides and group_key in config_overrides:
+            return config_overrides[group_key]
+
+        parts = group_key.split("|")
+        age = parts[0]
+        origin = parts[1] if len(parts) > 1 else ""
+
+        # 基岩 (无成因)
+        if not origin:
+            rock_name = ""
+            for lid in layer_names:
+                name = layer_names.get(lid, "")
+                for prefix in ("强风化", "中风化", "微风化", "碎块状强风化",
+                               "全风化", "弱风化"):
+                    if name.startswith(prefix):
+                        rock_name = name[len(prefix):]
+                        break
+                if rock_name:
+                    break
+            # 尝试从岩石代码映射
+            if not rock_name:
+                rock_name = self.ROCK_TYPE_MAP.get("150", "花岗片麻岩")
+            return f"{self.AGE_PREFIXES.get(age, age)}{rock_name}（{age}）"
+
+        # 第四系沉积层
+        age_prefix = self.AGE_PREFIXES.get(age, age)
+        origin_name = self.ORIGIN_NAMES.get(origin, origin + "层")
+        return f"{age_prefix}{origin_name}（{age}{origin}）"
+
+    # ---- 主读取入口 ----
+
+    def read(self) -> Dict[str, Any]:
+        """读取华宁数据库全部数据
+
+        返回:
+        {
+            "available": True/False,
+            "descriptions": {layer_id: {name, description}},
+            "layer_sequence": [{layer_id, rock_code, origin, age}],
+            "age_groups": [(group_key, [layer_ids])],
+            "borehole_layers": {bh_id: [{layer_id, depth}]},
+            "unpentrated": set(),
+            "max_exposed": {layer_id: max_depth},
+            "spt_records": [...],
+            "sample_records": [...],
+            "spt_counts": {layer_id: count},
+            "sample_counts": {layer_id: {type: count}},
+        }
+        """
+        descriptions = self.read_layer_descriptions()
+        if not descriptions:
+            logger.info("    华宁数据库: ZHMS 文件不存在或为空")
+            return {"available": False}
+
+        layer_sequence = self.read_layer_sequence()
+        bh_layers, unpentrated, max_exposed = self.read_borehole_layers()
+        spt_records = self.read_spt_data()
+        sample_records = self.read_sample_data()
+
+        age_groups = self.build_age_groups(layer_sequence)
+        spt_counts = self.compute_spt_counts(spt_records, bh_layers)
+        sample_counts = self.compute_sample_counts(sample_records, bh_layers)
+
+        logger.info(
+            f"    华宁数据库: {len(descriptions)} 层描述, "
+            f"{len(layer_sequence)} 层序列, "
+            f"{len(bh_layers)} 孔, "
+            f"{len(spt_records)} 条标贯, "
+            f"{len(sample_records)} 件取样"
+        )
+
+        return {
+            "available": True,
+            "descriptions": descriptions,
+            "layer_sequence": layer_sequence,
+            "age_groups": age_groups,
+            "borehole_layers": bh_layers,
+            "unpentrated": unpentrated,
+            "max_exposed": max_exposed,
+            "spt_records": spt_records,
+            "sample_records": sample_records,
+            "spt_counts": spt_counts,
+            "sample_counts": sample_counts,
+        }
+
+
+# ============================================================
 # 报告填充器
 # ============================================================
 
@@ -1364,13 +1876,374 @@ class ReportFiller:
                 ))
                 break
 
-    # ---- 地层描述段落 ----
+    # ---- 地层描述段落 (第五章(二) 岩土结构及工程特性) ----
+
+    def _build_layer_display_name(
+        self, lid: str, name: str, geo_code: str,
+    ) -> str:
+        """构建地层段落的显示名称
+
+        格式: {lid}{name}（{geo_code}）
+        例: 1杂填土（Q4ml）, 5-1强风化花岗片麻岩（NhηγRw）
+        """
+        if geo_code:
+            return f"{lid}{name}（{geo_code}）"
+        return f"{lid}层{name}"
+
+    def _format_layer_stats_text(
+        self,
+        lid: str,
+        layer_stats: Dict[str, Any],
+        hn_data: Dict[str, Any],
+        bh_layers: Dict[str, List[Dict[str, Any]]],
+    ) -> str:
+        """构建地层段落的统计文本 (厚度/标高/埋深 或 未穿透)"""
+        unpentrated = hn_data.get("unpentrated", set())
+        max_exposed = hn_data.get("max_exposed", {})
+        ldata = layer_stats.get(lid, {})
+
+        if lid in unpentrated:
+            # 未穿透: 使用最大揭露厚度
+            max_d = max_exposed.get(lid, 0)
+            # 计算分布
+            bh_count = sum(
+                1 for layers in bh_layers.values()
+                if any(l["layer_id"] == lid for l in layers)
+            )
+            total_bh = len(bh_layers) or 1
+            ratio = bh_count / total_bh
+            dist = "普遍" if ratio > 0.5 else "较普遍" if ratio > 0.2 else "局部"
+            return (
+                f"该层在场区{dist}分布，未穿透，"
+                f"最大揭露厚度{max_d:.2f}m。"
+            )
+
+        # 正常穿透层: 厚度/标高/埋深统计
+        if not ldata:
+            return ""
+
+        # 计算分布
+        bh_count = sum(
+            1 for layers in bh_layers.values()
+            if any(l["layer_id"] == lid for l in layers)
+        )
+        total_bh = len(bh_layers) or 1
+        ratio = bh_count / total_bh
+        dist = "普遍" if ratio > 0.5 else "较普遍" if ratio > 0.2 else "局部"
+
+        return (
+            f"场区{dist}分布，"
+            f"厚度:{fmt_val(ldata.get('thick_min'))}~"
+            f"{fmt_val(ldata.get('thick_max'))}m,"
+            f"平均{fmt_val(ldata.get('thick_avg'))}m;"
+            f"层底标高:{fmt_val(ldata.get('elv_min'))}~"
+            f"{fmt_val(ldata.get('elv_max'))}m,"
+            f"平均{fmt_val(ldata.get('elv_avg'))}m;"
+            f"层底埋深:{fmt_val(ldata.get('depth_min'))}~"
+            f"{fmt_val(ldata.get('depth_max'))}m,"
+            f"平均{fmt_val(ldata.get('depth_avg'))}m。"
+        )
+
+    def _format_test_info_text(
+        self,
+        lid: str,
+        table_seq: int,
+        hn_data: Dict[str, Any],
+    ) -> str:
+        """构建试验信息段落文字"""
+        spt_count = hn_data.get("spt_counts", {}).get(lid, 0)
+        sample_types = hn_data.get("sample_counts", {}).get(lid, {})
+
+        type_0 = sample_types.get(0, 0)  # 扰动样
+        type_1 = sample_types.get(1, 0)  # 原状样
+
+        parts: List[str] = []
+        if type_1 > 0:
+            parts.append(f"取原状样{type_1}件")
+        if type_0 > 0:
+            parts.append(f"取扰动样{type_0}件")
+        if spt_count > 0:
+            parts.append(f"进行标准贯入试验{spt_count}次")
+
+        if not parts:
+            return ""
+
+        table_ref = f"，有关工程特性指标见表5-{table_seq}" if table_seq > 0 else ""
+        return "该层" + "，".join(parts) + table_ref + "。"
+
+    def _make_bold_paragraph(self, text: str, template_para: Any) -> Any:
+        """创建一个加粗段落 (复制模板段落的格式)"""
+        new_p = OxmlElement("w:p")
+
+        # 复制段落属性 (pPr) 并设置加粗
+        if template_para._element.find(qn("w:pPr")) is not None:
+            pPr = copy.deepcopy(template_para._element.find(qn("w:pPr")))
+            new_p.append(pPr)
+
+        # 创建 run
+        new_r = OxmlElement("w:r")
+
+        # 复制 run 属性 (rPr) 并强制加粗
+        if template_para.runs:
+            src_rPr = template_para.runs[0]._element.find(qn("w:rPr"))
+            if src_rPr is not None:
+                rPr = copy.deepcopy(src_rPr)
+                # 确保有 w:b 加粗标记
+                if rPr.find(qn("w:b")) is None:
+                    b_elem = OxmlElement("w:b")
+                    rPr.insert(0, b_elem)
+                new_r.append(rPr)
+            else:
+                rPr = OxmlElement("w:rPr")
+                b_elem = OxmlElement("w:b")
+                rPr.append(b_elem)
+                new_r.append(rPr)
+        else:
+            rPr = OxmlElement("w:rPr")
+            b_elem = OxmlElement("w:b")
+            rPr.append(b_elem)
+            new_r.append(rPr)
+
+        # 设置文字
+        new_t = OxmlElement("w:t")
+        new_t.text = text
+        new_t.set(qn("xml:space"), "preserve")
+        new_r.append(new_t)
+        new_p.append(new_r)
+
+        return new_p
+
+    def _make_normal_paragraph(self, text: str, template_para: Any) -> Any:
+        """创建一个普通段落 (复制模板段落的格式, 不加粗)"""
+        new_p = OxmlElement("w:p")
+
+        # 复制段落属性 (pPr)
+        if template_para._element.find(qn("w:pPr")) is not None:
+            pPr = copy.deepcopy(template_para._element.find(qn("w:pPr")))
+            # 移除 pPr 中的加粗 (pPr/rPr/w:b)
+            pPr_rPr = pPr.find(qn("w:rPr"))
+            if pPr_rPr is not None:
+                b_elem = pPr_rPr.find(qn("w:b"))
+                if b_elem is not None:
+                    pPr_rPr.remove(b_elem)
+            new_p.append(pPr)
+
+        # 创建 run
+        new_r = OxmlElement("w:r")
+
+        # 复制 run 属性 (rPr), 但确保不加粗
+        if template_para.runs:
+            src_rPr = template_para.runs[0]._element.find(qn("w:rPr"))
+            if src_rPr is not None:
+                rPr = copy.deepcopy(src_rPr)
+                # 确保没有 w:b 加粗标记
+                b_elem = rPr.find(qn("w:b"))
+                if b_elem is not None:
+                    rPr.remove(b_elem)
+                new_r.append(rPr)
+
+        # 设置文字
+        new_t = OxmlElement("w:t")
+        new_t.text = text
+        new_t.set(qn("xml:space"), "preserve")
+        new_r.append(new_t)
+        new_p.append(new_r)
+
+        return new_p
 
     def _fill_layer_descriptions(self) -> None:
-        logger.info("  地层描述段落...")
+        """填充第五章(二) 岩土结构及工程特性
+
+        优先使用华宁数据库数据 (ZHMS/DCSH/BG/TY/DCSJ) 动态生成;
+        若无数据库则回退到模板匹配模式。
+        """
+        hn_data = self.data.get("hn_data", {})
         layer_stats = self.data.get("layers", {})
 
-        # 默认地层描述模板 (威海滨海区典型)
+        if not hn_data or not hn_data.get("available"):
+            logger.info("  地层描述段落... (模板模式)")
+            self._fill_layer_descriptions_fallback(layer_stats)
+            return
+
+        logger.info("  地层描述段落... (华宁数据库模式)")
+
+        descriptions = hn_data.get("descriptions", {})
+        age_groups = hn_data.get("age_groups", [])
+        bh_layers = hn_data.get("borehole_layers", {})
+        unpentrated = hn_data.get("unpentrated", set())
+
+        # 从 DCSH 层序列构建层号→地质代号映射
+        geo_codes: Dict[str, str] = {}
+        for rec in hn_data.get("layer_sequence", []):
+            lid = rec["layer_id"]
+            age = rec.get("age", "")
+            origin = rec.get("origin", "")
+            if origin:
+                geo_codes[lid] = f"{age}{origin}"
+            elif age:
+                geo_codes[lid] = age
+
+        # 获取地质年代名称配置覆盖
+        geo_age_overrides = self.config.get_geo_age_names()
+
+        # 定位 (二) 和 (三) 节
+        section_start = None
+        section_end = None
+        intro_para = None
+        closing_para = None
+        intro_idx = None
+        closing_idx = None
+
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if not txt:
+                continue
+            if re.match(r"[（(]二[）)]", txt):
+                section_start = i
+            elif section_start is not None and re.match(r"[（(]三[）)]", txt):
+                section_end = i
+                break
+
+        if section_start is None:
+            logger.warning("    未找到(二)节标记, 回退到模板模式")
+            self._fill_layer_descriptions_fallback(layer_stats)
+            return
+
+        # 查找 intro 和 closing
+        if section_start + 1 < len(self.doc.paragraphs):
+            intro_para = self.doc.paragraphs[section_start + 1]
+            intro_idx = section_start + 1
+
+        if section_end is not None:
+            closing_idx = section_end - 1
+            if closing_idx > (intro_idx or section_start):
+                closing_para = self.doc.paragraphs[closing_idx]
+
+        # 确定插入锚点和需要清除的范围
+        body = self.doc.element.body
+        anchor = intro_para._element if intro_para else \
+            self.doc.paragraphs[section_start]._element
+
+        # 清除 intro 与 (三) 之间的所有内容 (段落+表格)
+        if intro_para and section_end is not None:
+            start_elem = intro_para._element
+            end_elem = self.doc.paragraphs[section_end]._element
+            elems_to_remove = []
+            clearing = False
+            for child in body:
+                if child is start_elem:
+                    clearing = True
+                    continue
+                if child is end_elem:
+                    break
+                if clearing:
+                    elems_to_remove.append(child)
+            for elem in elems_to_remove:
+                body.remove(elem)
+
+        # 保留 closing 段落 (如果有)
+        # 否则在末尾添加
+        if closing_para is not None and closing_para._element.getparent() is not None:
+            # closing 段落还在, 移到 section_end 之前
+            pass
+        else:
+            closing_para = None
+
+        # 生成新段落内容
+        hn_reader = HuaNingDBReader("", "")  # 仅用于静态方法
+        table_seq = 0
+        inserted_elements: List[Any] = []
+
+        for group_key, layer_ids_in_group in age_groups:
+            # 1) 地质年代标题 (加粗)
+            # 获取层名映射 (合并 HN 描述和现有 layer_names)
+            merged_names = dict(self.layer_names)
+            for lid, info in descriptions.items():
+                if lid not in merged_names:
+                    merged_names[lid] = info["name"]
+
+            age_display = hn_reader.build_age_display_name(
+                group_key, merged_names, geo_age_overrides,
+            )
+            bold_p = self._make_bold_paragraph(age_display, intro_para)
+            inserted_elements.append(bold_p)
+
+            # 2) 每层段落
+            for lid in layer_ids_in_group:
+                desc_info = descriptions.get(lid, {})
+                name = desc_info.get("name", self.layer_names.get(lid, f"第{lid}层"))
+                desc_text = desc_info.get("description", "")
+                geo_code = geo_codes.get(lid, "")
+
+                # 使用配置文件的描述覆盖 (如果有)
+                config_desc = self.config.get_layer_description(lid)
+                if config_desc:
+                    # 配置描述是完整模板, 可含 {thick_*} 占位符
+                    ldata = layer_stats.get(lid, {})
+                    try:
+                        desc_text = config_desc.format(
+                            thick_min=fmt_val(ldata.get("thick_min")),
+                            thick_max=fmt_val(ldata.get("thick_max")),
+                            thick_avg=fmt_val(ldata.get("thick_avg")),
+                            depth_min=fmt_val(ldata.get("depth_min")),
+                            depth_max=fmt_val(ldata.get("depth_max")),
+                            depth_avg=fmt_val(ldata.get("depth_avg")),
+                            elv_min=fmt_val(ldata.get("elv_min")),
+                            elv_max=fmt_val(ldata.get("elv_max")),
+                            elv_avg=fmt_val(ldata.get("elv_avg")),
+                        )
+                    except (KeyError, IndexError):
+                        pass
+
+                # 构建完整段落
+                display_name = self._build_layer_display_name(lid, name, geo_code)
+                stats_text = self._format_layer_stats_text(
+                    lid, layer_stats, hn_data, bh_layers,
+                )
+
+                para_text = f"{display_name}：{desc_text}"
+                if desc_text and not desc_text.endswith(("。", "，")):
+                    para_text += "。"
+                if stats_text:
+                    if not para_text.endswith("。"):
+                        para_text += "。"
+                    para_text += stats_text
+
+                layer_p = self._make_normal_paragraph(para_text, intro_para)
+                inserted_elements.append(layer_p)
+
+                # 3) 试验信息段落
+                table_seq += 1
+                test_text = self._format_test_info_text(lid, table_seq, hn_data)
+                if test_text:
+                    test_p = self._make_normal_paragraph(test_text, intro_para)
+                    inserted_elements.append(test_p)
+
+                # 4) 表标题段落
+                table_title = f"第{lid}层{name}工程特性指标统计表         表5-{table_seq}"
+                title_p = self._make_normal_paragraph(table_title, intro_para)
+                inserted_elements.append(title_p)
+
+        # 5) 收尾段落
+        closing_text = "以上各层的埋藏与分布见工程地质剖面图。"
+        closing_p = self._make_normal_paragraph(closing_text, intro_para)
+        inserted_elements.append(closing_p)
+
+        # 在 anchor 之后批量插入
+        for elem in reversed(inserted_elements):
+            anchor.addnext(elem)
+
+        # 如果有原有的 closing 段落 (被保留), 移到 inserted 之后
+        # (已在上方处理)
+
+        logger.info(
+            f"    华宁模式: {len(age_groups)} 个年代组, "
+            f"{sum(len(ids) for _, ids in age_groups)} 层, "
+            f"{table_seq} 张表"
+        )
+
+    def _fill_layer_descriptions_fallback(self, layer_stats: Dict) -> None:
+        """回退模式: 基于模板段落匹配填充地层描述 (原始逻辑)"""
         default_desc_templates: Dict[str, str] = {
             "1": (
                 "黄褐色、灰褐色，松散、局部中密，强度不均，主要成分为风化岩渣土、"
@@ -1413,13 +2286,11 @@ class ReportFiller:
                 ):
                     continue
 
-                # 优先使用配置文件中的描述，其次默认模板，最后通用模板
                 desc_tpl = (
                     self.config.get_layer_description(lid)
                     or default_desc_templates.get(lid)
                 )
 
-                # 准备数据
                 fmt_data = {
                     "thick_min": fmt_val(ldata.get("thick_min")),
                     "thick_max": fmt_val(ldata.get("thick_max")),
@@ -1436,7 +2307,6 @@ class ReportFiller:
                     if desc_tpl:
                         text = desc_tpl.format(**fmt_data)
                     else:
-                        n_val = fmt_val_int(ldata.get("n", ""))
                         n_num = ldata.get("n", 0) or 0
                         dist = (
                             "普遍" if n_num > 50
@@ -1451,7 +2321,7 @@ class ReportFiller:
                 filled.add(lid)
                 break
 
-        logger.info(f"    已更新: {sorted(filled)}")
+        logger.info(f"    回退模式已更新: {sorted(filled)}")
 
     # ---- 物理力学 & 原位测试表 ----
 
@@ -2701,6 +3571,17 @@ def main() -> None:
     layer_names, layer_ids = load_layer_names(config, loader, layer_stats, args.layers)
     logger.info(f"  地层 ID 序列: {layer_ids}")
 
+    # 华宁数据库 (可选)
+    hn_data: Dict[str, Any] = {"available": False}
+    hn_db_dir = config.get_hn_db_dir()
+    if hn_db_dir and os.path.isdir(hn_db_dir):
+        logger.info(f"\n[华宁数据库] 目录: {hn_db_dir}")
+        project_code = config.get_hn_project_code()
+        reader = HuaNingDBReader(hn_db_dir, project_code)
+        hn_data = reader.read()
+    elif hn_db_dir:
+        logger.warning(f"  华宁数据库目录不存在: {hn_db_dir}")
+
     if args.dry_run:
         logger.info("\n[Dry-run] 数据加载完成，不生成报告。")
         return
@@ -2721,6 +3602,7 @@ def main() -> None:
         "buildings": buildings,
         "water_samples": water_samples,
         "salt_samples": salt_samples,
+        "hn_data": hn_data,
     }
 
     filler = ReportFiller(
