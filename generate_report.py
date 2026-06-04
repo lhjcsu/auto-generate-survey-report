@@ -1015,6 +1015,7 @@ class HuaNingDBReader:
         "eol": "风积层",
         "l": "湖积层",
         "m": "海积层",
+        "mc": "海陆交互相沉积层",
         "fgl": "冰水沉积层",
     }
 
@@ -1026,6 +1027,8 @@ class HuaNingDBReader:
         "Q1": "第四系下更新统",
         "N": "新近系",
         "Nh": "新元古界",
+        "Pt": "元古界",
+        "Ar": "太古界",
     }
 
     # 岩石代码 → 岩石名称 (5位岩性码 = 风化程度2位 + 岩石类型3位)
@@ -1377,7 +1380,8 @@ class HuaNingDBReader:
             origin = rec.get("origin", "")
             layer_id = rec["layer_id"]
 
-            if origin:
+            # 基岩层 origin 为纯数字 (如 "1") 时视为无成因
+            if origin and not origin.isdigit():
                 key = f"{age}|{origin}"
             else:
                 key = age
@@ -2078,7 +2082,8 @@ class ReportFiller:
             lid = rec["layer_id"]
             age = rec.get("age", "")
             origin = rec.get("origin", "")
-            if origin:
+            # 基岩层 origin 为纯数字时不计入代号
+            if origin and not origin.isdigit():
                 geo_codes[lid] = f"{age}{origin}"
             elif age:
                 geo_codes[lid] = age
