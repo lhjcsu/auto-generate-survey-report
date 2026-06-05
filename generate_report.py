@@ -58,6 +58,25 @@ except ImportError:
 
 from corrosion_eval import evaluate_corrosion
 
+# 波速 (方案一: 估算 / 方案二: 实测数据解析)
+try:
+    from wave_velocity_estimate import (
+        estimate_vs,
+        compute_equivalent_vs,
+        compute_cover_thickness,
+        classify_site,
+        evaluate_site_class_from_layers,
+    )
+except ImportError:
+    estimate_vs = compute_equivalent_vs = compute_cover_thickness = None  # type: ignore
+    classify_site = evaluate_site_class_from_layers = None  # type: ignore
+
+try:
+    from wave_velocity_parser import load_wave_velocity_data
+except ImportError:
+    load_wave_velocity_data = None  # type: ignore
+
+
 
 def _check_dependencies() -> None:
     """检查第三方依赖是否已安装"""
@@ -665,6 +684,8 @@ class SurveyDataLoader:
                 "type": safe_str(rows[r][2]),
                 "elevation": safe_float(rows[r][3]),
                 "depth": safe_float(rows[r][4]),
+                "x": safe_float(rows[r][5]),
+                "y": safe_float(rows[r][6]),
                 "wt_depth": safe_float(rows[r][7]),
                 "wt_elv": safe_float(rows[r][8]),
                 "undisturbed": int(safe_float(rows[r][9], 0)),
@@ -3126,6 +3147,7 @@ class ReportFiller:
         self._fill_foundation_tables()
         self._fill_conclusion()
         self._fill_site_conditions()
+        self._fill_wave_velocity_table()    # 波速估算 & 场地类别判定
         self._fill_site_evaluation()
         self._fill_foundation_evaluation()
         self._fill_analysis_evaluation()    # 16. 第六章: 分析评价各子节
@@ -4844,6 +4866,375 @@ class ReportFiller:
             logger.info(f"  场地条件: 替换 {replaced_count} 段")
         else:
             logger.debug("  场地条件: 未找到匹配段落")
+
+    # ---- 等效剪切波速估算 & 场地类别判定 (GB 50011-2010 §4.1) ----
+
+    def _select_wave_velocity_boreholes(
+        self, boreholes: List[Dict[str, Any]], count: int
+    ) -> List[Dict[str, Any]]:
+        """选取波速估算钻孔，按空间分布均匀选取
+
+        Args:
+            boreholes: 所有钻孔列表 (含 x, y, elevation, depth, type)
+            count: 选取数量 (2 或 3)
+
+        Returns:
+            选取的钻孔列表
+        """
+        if len(boreholes) <= count:
+            return list(boreholes)
+
+        # 优先选有坐标的钻孔
+        with_xy = [bh for bh in boreholes if bh.get("x") and bh.get("y")]
+        if len(with_xy) >= count:
+            # 按坐标空间分布选取: 取边界极点 + 中间点
+            pool = sorted(with_xy, key=lambda bh: bh["x"])  # 按X排序
+            if count == 2:
+                # 一东一西 (X坐标最远端)
+                selected = [pool[0], pool[-1]]
+            else:  # count == 3
+                # 东西两端 + Y方向中间
+                mid_idx = len(pool) // 2
+                # 在中间1/3范围内按Y取中间值
+                third = len(pool) // 3
+                mid_pool = sorted(pool[third: 2 * third], key=lambda bh: bh.get("y", 0) or 0)
+                selected = [pool[0], mid_pool[len(mid_pool)//2] if mid_pool else pool[mid_idx], pool[-1]]
+            # 去重
+            seen = set()
+            result = []
+            for bh in selected:
+                key = bh.get("id", "")
+                if key not in seen:
+                    seen.add(key)
+                    result.append(bh)
+            if len(result) >= count:
+                return result[:count]
+
+        # 回退: 按孔深降序，取最深的 count 个（深孔穿透更多地层，Vs估算更准确）
+        deep = sorted(boreholes, key=lambda bh: bh.get("depth") or 0, reverse=True)
+        # 尽量分散: 取最深的 + 中等 + 最浅的
+        n = len(deep)
+        indices = [0] if count == 1 else [0, n - 1] if count == 2 else [0, n // 2, n - 1]
+        result = []
+        seen = set()
+        for i in indices:
+            if i < n:
+                key = deep[i].get("id", "")
+                if key not in seen:
+                    seen.add(key)
+                    result.append(deep[i])
+        return result[:count]
+
+    def _get_borehole_layers_for_vs(
+        self, bh_id: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """获取指定钻孔的分层数据，用于波速估算
+
+        优先从华宁 DCSJ 读取，回退到 Excel 地层统计
+        """
+        hn_data = self.data.get("hn_data", {})
+        if hn_data and hn_data.get("available"):
+            bh_layers = hn_data.get("borehole_layers", {})
+            descriptions = hn_data.get("descriptions", {})
+            if bh_id in bh_layers:
+                layers = []
+                prev_depth = 0.0
+                for entry in bh_layers[bh_id]:
+                    lid = entry["layer_id"]
+                    depth = entry.get("depth")
+                    name = descriptions.get(lid, {}).get("name", f"第{lid}层")
+                    thickness = (depth - prev_depth) if depth is not None else 0
+                    if thickness > 0:
+                        layers.append({
+                            "name": name,
+                            "thickness": round(thickness, 1),
+                            "depth_bottom": round(depth, 1) if depth else None,
+                        })
+                    prev_depth = depth if depth else prev_depth
+                return layers if layers else None
+
+        # 回退: 用 Excel 地层统计数据（按平均厚度，孔间差异忽略）
+        layer_stats = self.data.get("layers", {})
+        if layer_stats:
+            return [
+                {"name": info.get("name", ""), "thickness": info.get("thick_avg", 0) or 0}
+                for lid, info in sorted(layer_stats.items(),
+                                        key=lambda x: layer_sort_key(x[0]))
+            ]
+        return None
+
+    def _fill_wave_velocity_table(self) -> None:
+        """填充等效剪切波速计算及场地类别判定表
+
+        优先方案二 (实测波速数据):
+            自动检测项目 base_dir/波速/ 目录下的波速报告.docx 或波速数据.xlsx
+        回退方案一 (估算):
+            按土层名称估算 Vs → 计算 νse → 判定场地类别
+        """
+        if evaluate_site_class_from_layers is None:
+            logger.debug("  波速: 模块未加载，跳过")
+            return
+
+        # ---- 1. 查找波速表 (按表头关键词匹配) ----
+        wave_table = None
+        for ti, t in enumerate(self.doc.tables):
+            header_text = ""
+            for ri in range(min(3, len(t.rows))):
+                cells_text = [cell.text.strip() for cell in t.rows[ri].cells]
+                header_text += " ".join(cells_text)
+            if any(kw in header_text for kw in ["等效剪切波速", "场地类别判定"]):
+                wave_table = t
+                logger.info(f"  波速表: 表格 #{ti} ({len(t.rows)-1}行数据区)")
+                break
+
+        if wave_table is None:
+            logger.debug("  波速表: 模板中未找到等效剪切波速表，跳过")
+            return
+
+        # ---- 2. 尝试加载实测波速数据 (方案二) ----
+        wave_data = self._load_wave_velocity_from_project()
+        if wave_data:
+            self._fill_wave_table_from_real_data(wave_table, wave_data)
+            return
+
+        # ---- 回退方案一: 估算 ----
+        self._fill_wave_table_by_estimation(wave_table)
+
+    def _load_wave_velocity_from_project(self) -> Optional[List[Dict[str, Any]]]:
+        """自动检测项目目录中的波速数据"""
+        if load_wave_velocity_data is None:
+            return None
+
+        base_dir = self.config.base_dir
+        if not base_dir:
+            return None
+
+        # 自动检测 波速/ 子目录
+        wave_dir = os.path.join(base_dir, "波速")
+        if not os.path.isdir(wave_dir):
+            # 尝试 已有资料/波速/
+            wave_dir = os.path.join(base_dir, "已有资料", "波速")
+        if not os.path.isdir(wave_dir):
+            # 尝试直接找文件
+            for root, dirs, files in os.walk(base_dir):
+                for d in dirs:
+                    if "波速" in d:
+                        wave_dir = os.path.join(root, d)
+                        break
+                if os.path.isdir(wave_dir):
+                    break
+
+        if not os.path.isdir(wave_dir):
+            logger.debug("  波速: 未找到波速数据目录")
+            return None
+
+        docx_path = None; xlsx_path = None
+        for f in os.listdir(wave_dir):
+            fp = os.path.join(wave_dir, f)
+            if f.endswith(".docx") and not f.startswith("~$") and "波速" in f:
+                docx_path = fp
+            elif f.endswith(".xlsx") and not f.startswith("~$") and "波速" in f:
+                xlsx_path = fp
+
+        if not docx_path and not xlsx_path:
+            logger.debug(f"  波速: 目录存在但未找到波速文件: {wave_dir}")
+            return None
+
+        logger.info(f"  波速: 加载实测数据 — {wave_dir}")
+        data = load_wave_velocity_data(xlsx_path=xlsx_path, docx_path=docx_path)
+        logger.info(f"  波速: 共 {len(data)} 个钻孔实测数据")
+        return data if data else None
+
+    def _fill_wave_table_from_real_data(
+        self, tbl, wave_data: List[Dict[str, Any]]
+    ) -> None:
+        """用实测波速数据填充表格 (方案二)"""
+        # 判断表格格式: 8列(逐层) vs 6列(汇总)
+        col_count = len(tbl.columns)
+        is_detail_table = col_count >= 7
+
+        # 找数据起始行
+        data_start_row = 1
+        for ri in range(min(3, len(tbl.rows))):
+            row_text = " ".join(c.text.strip() for c in tbl.rows[ri].cells)
+            if "钻孔编号" in row_text or "孔号" in row_text or "序号" in row_text:
+                data_start_row = ri + 1
+                break
+
+        # 如果实测数据有 layers，填充逐层详情
+        first = wave_data[0]
+        has_layers = "layers" in first and first.get("layers")
+
+        current_row = data_start_row
+        for data in wave_data:
+            bh_id = data.get("bh_id", "")
+            vse = data.get("vse")
+            cover = data.get("cover_thickness")
+            sc = data.get("site_class", "")
+
+            if has_layers:
+                # 逐层填充 (8列格式)
+                for li, layer in enumerate(data["layers"]):
+                    if current_row >= len(tbl.rows):
+                        break
+                    if li == 0:
+                        set_cell(tbl, current_row, 0, bh_id)
+                        set_cell(tbl, current_row, 6,
+                                 f"<{cover}m" if cover and cover > 50 else str(cover or ""))
+                        set_cell(tbl, current_row, 7,
+                                 f"{vse}m/s" if vse else "")
+                    else:
+                        set_cell(tbl, current_row, 0, "")
+                        set_cell(tbl, current_row, 6, "")
+                        set_cell(tbl, current_row, 7, "")
+
+                    set_cell(tbl, current_row, 1, str(li + 1))
+                    set_cell(tbl, current_row, 2, layer.get("name", ""))
+                    set_cell(tbl, current_row, 3, str(layer.get("vs", "")))
+                    set_cell(tbl, current_row, 4, str(layer.get("depth", "")))
+                    set_cell(tbl, current_row, 5, str(layer.get("thickness", "")))
+                    current_row += 1
+            else:
+                # 汇总格式 (6列): 序号 | 孔号 | 覆盖层 | d0 | νse | 场地类别
+                if current_row >= len(tbl.rows):
+                    break
+                set_cell(tbl, current_row, 0, str(current_row - data_start_row + 1))
+                set_cell(tbl, current_row, 1, f"ZK{bh_id}" if not bh_id.startswith("ZK") else bh_id)
+                if col_count >= 3:
+                    set_cell(tbl, current_row, 2, str(cover) if cover else "")
+                if col_count >= 4:
+                    d0_val = data.get("d0", min(cover or 20, 20))
+                    set_cell(tbl, current_row, 3, str(d0_val) if d0_val else "")
+                if col_count >= 5:
+                    set_cell(tbl, current_row, 4, str(vse) if vse else "")
+                if col_count >= 6:
+                    set_cell(tbl, current_row, 5, sc)
+                current_row += 1
+
+        # 综合判定
+        all_vse = [d.get("vse") for d in wave_data if d.get("vse")]
+        all_sc = [d.get("site_class") for d in wave_data if d.get("site_class")]
+        if all_vse and all_sc:
+            avg_vse = round(sum(all_vse) / len(all_vse), 1)
+            unique_sc = list(set(all_sc))
+            sc_display = unique_sc[0] if len(unique_sc) == 1 else "~".join(sorted(
+                unique_sc, key=lambda x: {"I₀": 0, "I₁": 1, "Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4}.get(x, 0)
+            ))
+            logger.info(
+                f"  波速综合: νse={min(all_vse)}~{max(all_vse)}m/s, "
+                f"场地类别={sc_display}"
+            )
+
+            # 更新段落: "本场地在0～XXm深度范围内等效剪切波速为XX～XXm/s"
+            for p in self.doc.paragraphs:
+                txt = p.text.strip()
+                if "等效剪切波速为" in txt and ("深度范围内" in txt or "场地覆盖层" in txt):
+                    cover_min = min(d.get("cover_thickness", 0) or 0 for d in wave_data)
+                    cover_max = max(d.get("cover_thickness", 0) or 0 for d in wave_data)
+                    new_text = (
+                        f"据测试结果，本场地在0～{cover_max:.1f}m深度范围内"
+                        f"等效剪切波速为{min(all_vse):.1f}～{max(all_vse):.1f}m/s，"
+                        f"场地覆盖层厚度{cover_min:.1f}～{cover_max:.1f}m，"
+                        f"依据《建筑与市政工程抗震通用规范》(GB55002)中规定，"
+                        f"该建筑场地类别属于{sc_display}类。"
+                    )
+                    set_para_text(p, new_text)
+                    break
+
+        # 更新波速测试段落
+        bh_ids = [d.get("bh_id", "") for d in wave_data]
+        for p in self.doc.paragraphs:
+            txt = p.text.strip()
+            if "剪切波测试" in txt and ("钻孔内进行了" in txt or "号钻孔" in txt):
+                new_text = (
+                    f"在本场地{'、'.join(bh_ids[:6])}号等{len(bh_ids)}个钻孔内"
+                    f"进行了岩土体剪切波测试，实测成果见表5-11。"
+                )
+                set_para_text(p, new_text)
+                break
+
+    def _fill_wave_table_by_estimation(self, tbl) -> None:
+        """估算模式填充波速表 (方案一)"""
+        boreholes = self.data.get("boreholes", [])
+        buildings = self.data.get("buildings", [])
+        total_bh = len(boreholes)
+
+        is_large = len(buildings) > 3 or total_bh > 50
+        bh_count = 3 if is_large else 2
+        selected_bhs = self._select_wave_velocity_boreholes(boreholes, bh_count)
+
+        if not selected_bhs:
+            logger.warning("  波速表: 无可用钻孔")
+            return
+
+        logger.info(
+            f"  波速估算: {'大' if is_large else '小'}场地, "
+            f"选 {len(selected_bhs)} 孔: "
+            f"{[bh['id'] for bh in selected_bhs]}"
+        )
+
+        # 逐孔估算
+        results: List[Dict[str, Any]] = []
+        for bh in selected_bhs:
+            bh_id = bh.get("id", "")
+            layers = self._get_borehole_layers_for_vs(bh_id)
+            if not layers:
+                continue
+            r = evaluate_site_class_from_layers(layers)
+            r["bh_id"] = bh_id
+            results.append(r)
+            logger.info(
+                f"    钻孔 {bh_id}: νse={r['vse']}m/s, "
+                f"d={r['cover_thickness']}m, {r['site_class']}类"
+            )
+
+        if not results:
+            logger.warning("  波速表: 所有钻孔均无有效数据")
+            return
+
+        # 填充表格 (逐层详情)
+        data_start_row = 1
+        for ri in range(min(3, len(tbl.rows))):
+            row_text = " ".join(c.text.strip() for c in tbl.rows[ri].cells)
+            if "钻孔编号" in row_text or "土层编号" in row_text:
+                data_start_row = ri + 1
+                break
+
+        current_row = data_start_row
+        for r in results:
+            for li, layer in enumerate(r["layers_detail"]):
+                if current_row >= len(tbl.rows):
+                    break
+                if li == 0:
+                    set_cell(tbl, current_row, 0, r["bh_id"])
+                    set_cell(tbl, current_row, 7, f"{r['vse']}m/s")
+                    set_cell(tbl, current_row, 6,
+                             f"<{r['cover_thickness']}m"
+                             if r['cover_thickness'] > 50
+                             else str(r['cover_thickness']))
+                else:
+                    set_cell(tbl, current_row, 0, "")
+                    set_cell(tbl, current_row, 6, "")
+                    set_cell(tbl, current_row, 7, "")
+                set_cell(tbl, current_row, 1, str(li + 1))
+                set_cell(tbl, current_row, 2, layer["name"])
+                set_cell(tbl, current_row, 3, str(layer["vs"]))
+                set_cell(tbl, current_row, 4, str(layer["depth_bottom"]))
+                set_cell(tbl, current_row, 5, str(layer["thickness"]))
+                current_row += 1
+
+        # 更新波速段落
+        bh_ids_str = "、".join(r["bh_id"] for r in results)
+        for p in self.doc.paragraphs:
+            txt = p.text.strip()
+            if not txt:
+                continue
+            if "剪切波测试" in txt and ("钻孔内进行了" in txt or "号钻孔" in txt):
+                set_para_text(p, (
+                    f"在本场地{bh_ids_str}号等{len(results)}个钻孔内"
+                    f"进行了岩土体剪切波测试，实测成果见表5-11。"
+                ))
+                break
 
     # ---- 场地稳定性及适宜性评价 (CJJ57-2012) ----
 
