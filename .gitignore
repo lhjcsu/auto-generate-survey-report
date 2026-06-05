@@ -1,2 +1,4 @@
 .trash/
 __pycache__/
+_building_info.json
+*.pyc

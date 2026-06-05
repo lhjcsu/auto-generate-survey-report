@@ -30,6 +30,7 @@ import copy
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -488,6 +489,31 @@ class ProjectConfig:
         """获取华宁项目代码"""
         return self.raw.get("hn_project_code", "")
 
+    def get_sj_dir(self) -> str:
+        """获取 sj 目录路径 (简报 docx 所在位置)
+
+        优先级:
+        1. 显式配置 ``sj_dir``
+        2. ``hn_db_dir`` 目录 (通常简报也在同一目录)
+        3. 在 ``base_dir`` 下搜索 sj / SJ 子目录
+        """
+        d = self.raw.get("sj_dir", "")
+        if d:
+            return d if os.path.isabs(d) else os.path.join(self.base_dir, d)
+
+        # 回退到 hn_db_dir
+        hn = self.get_hn_db_dir()
+        if hn and os.path.isdir(hn):
+            return hn
+
+        # 在 base_dir 下搜索 sj/SJ
+        for sub in ("sj", "SJ"):
+            candidate = os.path.join(self.base_dir, sub)
+            if os.path.isdir(candidate):
+                return candidate
+
+        return ""
+
     def get_seismic_params(self) -> Dict[str, str]:
         """
         获取地震动参数 (自动查表 + config覆盖)。
@@ -523,6 +549,65 @@ class ProjectConfig:
                 result[key] = str(seismic_cfg[key])
 
         return result
+
+    def get_dxf_path(self) -> str:
+        """获取 DXF 总平面图路径
+
+        优先级:
+        1. config 中 ``dxf_path`` 显式指定
+        2. ``base_dir``/图/ 下搜索 .dxf 文件 (取含 "总图" 或 "平面图" 的第一个)
+        """
+        dxf = self.raw.get("dxf_path", "")
+        if dxf:
+            return dxf if os.path.isabs(dxf) else os.path.join(self.base_dir, dxf)
+
+        # 在 图/ 子目录搜索
+        tu_dir = os.path.join(self.base_dir, "图")
+        if os.path.isdir(tu_dir):
+            candidates = []
+            for f in os.listdir(tu_dir):
+                if f.lower().endswith(".dxf"):
+                    candidates.append(os.path.join(tu_dir, f))
+            # 优先含"总图"或"平面图"关键字
+            preferred = [
+                c for c in candidates
+                if "总图" in os.path.basename(c) or "平面图" in os.path.basename(c)
+            ]
+            if preferred:
+                return preferred[0]
+            elif candidates:
+                return candidates[0]
+
+        return ""
+
+    def get_building_info_path(self) -> str:
+        """获取建筑信息 JSON 路径
+
+        优先级:
+        1. config 中 ``building_info_path`` 显式指定
+        2. DXF 同目录下 ``*_建筑信息提取.json``
+        3. ``base_dir`` 下搜索 ``*_建筑信息提取.json``
+        """
+        bi = self.raw.get("building_info_path", "")
+        if bi:
+            return bi if os.path.isabs(bi) else os.path.join(self.base_dir, bi)
+
+        # DXF 同目录搜索
+        dxf_path = self.get_dxf_path()
+        if dxf_path:
+            dxf_dir = os.path.dirname(dxf_path)
+            dxf_base = os.path.splitext(os.path.basename(dxf_path))[0]
+            candidate = os.path.join(dxf_dir, f"{dxf_base}_建筑信息提取.json")
+            if os.path.isfile(candidate):
+                return candidate
+
+        # base_dir 递归搜索
+        for root, _dirs, files in os.walk(self.base_dir):
+            for f in files:
+                if "建筑信息提取" in f and f.endswith(".json"):
+                    return os.path.join(root, f)
+
+        return ""
 
 
 # ============================================================
@@ -1864,7 +1949,1130 @@ class HuaNingDBReader:
             "spt_counts": spt_counts,
             "sample_counts": sample_counts,
             "liquefaction_table": liq_table,
+            "elevation": self.read_elevation(),
+            "borehole_coords": self.read_borehole_coords(),
         }
+
+    # ---- DK 文件: 钻孔高程 ----
+
+    def read_elevation(self) -> Dict[str, Any]:
+        """读取 DK 文件 → 孔口高程统计
+
+        DK 文件格式: 孔号,地面高程,孔深,,水位深度,日期1,日期2,X,Y,,N
+        返回: {"elv_min": float, "elv_max": float, "elv_range": float}
+        """
+        rows = self._read_lines("DK")
+        if not rows:
+            return {}
+
+        elevations: List[float] = []
+        for fields in rows:
+            if len(fields) < 3:
+                continue
+            try:
+                elv = float(fields[1])
+                elevations.append(elv)
+            except (ValueError, TypeError):
+                continue
+
+        if not elevations:
+            return {}
+
+        elv_min = min(elevations)
+        elv_max = max(elevations)
+        return {
+            "elv_min": elv_min,
+            "elv_max": elv_max,
+            "elv_range": elv_max - elv_min,
+            "count": len(elevations),
+        }
+
+    def read_borehole_coords(self) -> Dict[str, Tuple[float, float]]:
+        """读取 DK 文件 → 钻孔坐标 {bh_id: (X, Y)}
+
+        DK 文件格式: 孔号,地面高程,孔深,,水位深度,日期1,日期2,X,Y,,N
+        字段索引:     0    1      2   3  4      5     6    7 8  9  10
+        """
+        rows = self._read_lines("DK")
+        if not rows:
+            return {}
+
+        coords: Dict[str, Tuple[float, float]] = {}
+        for fields in rows:
+            if len(fields) < 9:
+                continue
+            try:
+                bh_id = fields[0].strip()
+                x = float(fields[7])
+                y = float(fields[8])
+                if x > 0 and y > 0:
+                    coords[bh_id] = (x, y)
+            except (ValueError, TypeError):
+                continue
+
+        return coords
+
+    # ---- 地貌类型自动判定 ----
+
+    @staticmethod
+    def determine_terrain(
+        elv_range: float,
+        origins: set,
+        layer_names: List[str],
+    ) -> str:
+        """根据高程差、成因类型、地层组合自动判定地貌类型
+
+        规则:
+        1. 剥蚀丘陵: 高差>10m 且无 mc/m; 或地层仅有填土+残积土+基岩
+        2. 海岸平原: 相对平缓, 只有 m 无 mc/al/pl
+        3. 山区平原: 有陆相冲洪积层 (al/pl/al+pl) 无海相
+        4. 山前海积、冲洪积小平原交界地带: 陆相和海相均有
+        """
+        has_mc = "mc" in origins
+        has_m = "m" in origins
+        has_marine = has_mc or has_m
+        has_al = "al" in origins or "al+pl" in origins
+        has_pl = "pl" in origins
+        has_continental = has_al or has_pl
+
+        # 检查地层是否仅有 填土+残积土+基岩
+        fill_keywords = ("填", "素填", "杂填", "冲填")
+        residual_keywords = ("残积",)
+        rock_keywords = ("风化", "岩", "基岩")
+        only_fill_residual_rock = True
+        for name in layer_names:
+            is_fill = any(k in name for k in fill_keywords)
+            is_residual = any(k in name for k in residual_keywords)
+            is_rock = any(k in name for k in rock_keywords)
+            if not (is_fill or is_residual or is_rock):
+                only_fill_residual_rock = False
+                break
+
+        # 规则1: 剥蚀丘陵
+        if elv_range > 10 and not has_marine:
+            return "剥蚀丘陵"
+        if layer_names and only_fill_residual_rock:
+            return "剥蚀丘陵"
+
+        # 规则4: 陆相和海相均有 → 交界地带
+        if has_continental and has_marine:
+            return "山前海积、冲洪积小平原交界地带"
+
+        # 规则2: 只有海相 m, 无 mc/al/pl → 海岸平原
+        if has_m and not has_mc and not has_continental:
+            return "海岸平原"
+
+        # 规则3: 有陆相冲洪积层, 无海相 → 山区平原
+        if has_continental and not has_marine:
+            return "山区平原"
+
+        # 兜底: 有海陆交互 mc 但无陆相冲洪积
+        if has_mc and not has_continental:
+            return "海岸平原"
+
+        return ""
+
+    @staticmethod
+    def infer_origins_from_names(
+        layers: Dict[str, Any],
+    ) -> set:
+        """从简报地层名称和描述文本推断成因类型代码
+
+        简报中不含 DCSH 成因代码, 需从地层特征推断:
+            淤泥质/淤泥 → m (海积)
+            冲洪积 → al+pl
+            含黏性土砂 (含冲洪积描述) → al+pl
+            残积 → el
+            填土 → ml
+
+        Parameters
+        ----------
+        layers : dict
+            简报 ``layers`` 字段, 每层含 name 和 full_desc
+        """
+        origins: set = set()
+        for lid, info in layers.items():
+            if not isinstance(info, dict):
+                continue
+            name = info.get("name", "")
+            desc = info.get("full_desc", "")
+            combined = name + desc
+
+            # 海相标志: 淤泥质/淤泥 → m
+            if "淤泥" in combined or "淤泥质" in combined:
+                origins.add("m")
+
+            # 海陆交互: 含贝壳/腥臭 → mc
+            if "贝壳" in combined or "腥臭" in combined:
+                origins.add("mc")
+
+            # 冲洪积: 描述中明确提到
+            if "冲洪积" in combined:
+                origins.add("al+pl")
+            elif "冲积" in combined:
+                origins.add("al")
+            elif "洪积" in combined:
+                origins.add("pl")
+
+            # 残积
+            if "残积" in combined:
+                origins.add("el")
+
+            # 填土 → ml (人工)
+            if "填土" in combined or "杂填" in combined or "素填" in combined:
+                origins.add("ml")
+
+        return origins
+
+
+# ============================================================
+# 简报 (华宁生成 .docx) 读取
+# ============================================================
+
+def _bf(v: str) -> Optional[float]:
+    """安全转 float, 空串返回 None"""
+    if not v or not v.strip():
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _bf_str(v: str) -> str:
+    """安全转 float 并保留两位小数, 空串返回空串"""
+    f = _bf(v)
+    return f"{f:.2f}" if f is not None else ""
+
+
+def _cell(tbl: Any, r: int, c: int) -> str:
+    """安全读取表格单元格"""
+    try:
+        return tbl.rows[r].cells[c].text.strip().replace("\n", "")
+    except (IndexError, AttributeError):
+        return ""
+
+
+def read_briefing(sj_dir: str) -> Dict[str, Any]:
+    """从华宁生成的简报 docx 提取项目数据
+
+    搜索 ``岩土工程勘察报告.docx`` (优先 sj_dir 内, 回退上级目录)。
+    提取高程、地下水、地层描述、物理力学指标等。
+
+    Parameters
+    ----------
+    sj_dir : str
+        项目 sj/SJ 目录路径 (通常与 ``hn_db_dir`` 相同)
+
+    Returns
+    -------
+    dict  包含 available, elevation, groundwater, layers, physmech,
+          bearing, layer_count, project_id 等键
+    """
+    if not sj_dir or not os.path.isdir(sj_dir):
+        return {}
+
+    # ---- 查找文件 ----
+    briefing_path = ""
+    search_dirs = [sj_dir, os.path.dirname(sj_dir)]
+    for d in search_dirs:
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if f == "岩土工程勘察报告.docx":
+                    briefing_path = os.path.join(root, f)
+                    break
+            if briefing_path:
+                break
+        if briefing_path:
+            break
+
+    if not briefing_path:
+        logger.info(f"  简报: 在 {sj_dir} 及上级目录未找到 岩土工程勘察报告.docx")
+        return {}
+
+    logger.info(f"  简报文件: {briefing_path}")
+    doc = Document(briefing_path)
+
+    # ---- 按文档顺序收集段落和表格 ----
+    paragraphs: List[Tuple[int, str]] = []          # (body_idx, text)
+    tables: List[Tuple[int, Any]] = []               # (body_idx, table)
+
+    for idx, el in enumerate(doc.element.body):
+        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if tag == "p":
+            for p in doc.paragraphs:
+                if p._element is el:
+                    t = p.text.strip()
+                    if t:
+                        paragraphs.append((idx, t))
+                    break
+        elif tag == "tbl":
+            for tbl in doc.tables:
+                if tbl._element is el:
+                    tables.append((idx, tbl))
+                    break
+
+    # ---- 关键段落索引 ----
+    terrain_idx = -1       # "2.1 地形地貌" 段落序号
+    layer_start_idx = -1   # "3.1 地层结构" 段落序号
+    bearing_heading = -1   # "各层建议值" 段落序号
+    section4_idx = -1      # "4 岩土工程分析评价" 段落序号
+
+    for i, (_, text) in enumerate(paragraphs):
+        if "2.1" in text and "地形地貌" in text:
+            terrain_idx = i
+        elif "3.1" in text and "地层结构" in text:
+            layer_start_idx = i
+        elif "各层建议值" in text:
+            bearing_heading = i
+        elif text.startswith("4 ") and "岩土工程分析" in text:
+            section4_idx = i
+
+    result: Dict[str, Any] = {"available": True, "path": briefing_path}
+
+    # ================================================================
+    # 1) 高程数据  (从 "2.1 地形地貌" 段落提取)
+    # ================================================================
+    elv: Dict[str, Any] = {}
+    if terrain_idx >= 0:
+        txt = paragraphs[terrain_idx + 1][1] if terrain_idx + 1 < len(paragraphs) else ""
+        m = re.search(r"标高最大值\s*([\d.]+)\s*m", txt)
+        if m:
+            elv["max"] = float(m.group(1))
+        m = re.search(r"最小值\s*([\d.]+)\s*m", txt)
+        if m:
+            elv["min"] = float(m.group(1))
+        m = re.search(r"高差\s*([\d.]+)\s*m", txt)
+        if m:
+            elv["range"] = float(m.group(1))
+        elif elv.get("max") is not None and elv.get("min") is not None:
+            elv["range"] = elv["max"] - elv["min"]
+        # 地貌类型 (如果简报中已填写)
+        m = re.search(r"地貌类型为\s*(\S+?)[。\s,，]", txt)
+        if m:
+            elv["terrain_type"] = m.group(1)
+    result["elevation"] = elv
+
+    # ================================================================
+    # 2) 地下水  (Table 0: 7 列水位统计表)
+    # ================================================================
+    gw: Dict[str, Any] = {}
+    for _, tbl in tables:
+        if len(tbl.rows) < 2 or len(tbl.columns) < 7:
+            continue
+        h0 = tbl.rows[0].cells[0].text
+        if "数据" not in h0 and "个数" not in h0:
+            continue
+        h1 = tbl.rows[0].cells[1].text
+        if "稳定水位" not in h1:
+            continue
+        r1 = tbl.rows[1]
+        gw = {
+            "count": int(r1.cells[0].text.strip()) if r1.cells[0].text.strip().isdigit() else 0,
+            "depth_min": _bf(r1.cells[1].text),
+            "depth_max": _bf(r1.cells[2].text),
+            "depth_avg": _bf(r1.cells[3].text),
+            "elv_min": _bf(r1.cells[4].text),
+            "elv_max": _bf(r1.cells[5].text),
+            "elv_avg": _bf(r1.cells[6].text),
+        }
+        break
+    result["groundwater"] = gw
+
+    # ================================================================
+    # 3) 地层描述
+    # ================================================================
+    layers: "collections.OrderedDict[str, Dict]" = __import__("collections").OrderedDict()
+    layer_order: List[str] = []
+
+    if layer_start_idx >= 0:
+        end_i = section4_idx if section4_idx > 0 else len(paragraphs)
+        for i in range(layer_start_idx + 1, end_i):
+            _, text = paragraphs[i]
+            if "物理力学指标统计表" in text:
+                continue
+            m = re.match(r"(\d+(?:-\d+)?)层(\S+?)[：:]", text)
+            if not m:
+                continue
+
+            layer_id = m.group(1)
+            layer_name = m.group(2)
+            # 去除名称尾部的逗号
+            layer_name = layer_name.rstrip("，,")
+
+            d: Dict[str, Any] = {"id": layer_id, "name": layer_name, "full_desc": text}
+
+            # 厚度
+            tm = re.search(
+                r"厚度[:：]\s*([\d.]+)\s*[～~]\s*([\d.]+)\s*m\s*[,，]?\s*平均\s*([\d.]+)\s*m",
+                text,
+            )
+            if tm:
+                d["thickness"] = {
+                    "min": float(tm.group(1)),
+                    "max": float(tm.group(2)),
+                    "avg": float(tm.group(3)),
+                }
+
+            # 层底标高
+            em = re.search(
+                r"层底标高[:：]\s*(-?[\d.]+)\s*[～~]\s*(-?[\d.]+)\s*m\s*[,，]?\s*平均\s*(-?[\d.]+)\s*m",
+                text,
+            )
+            if em:
+                d["bottom_elevation"] = {
+                    "min": float(em.group(1)),
+                    "max": float(em.group(2)),
+                    "avg": float(em.group(3)),
+                }
+
+            # 层底埋深
+            dm = re.search(
+                r"层底埋深[:：]\s*([\d.]+)\s*[～~]\s*([\d.]+)\s*m\s*[,，]?\s*平均\s*([\d.]+)\s*m",
+                text,
+            )
+            if dm:
+                d["burial_depth"] = {
+                    "min": float(dm.group(1)),
+                    "max": float(dm.group(2)),
+                    "avg": float(dm.group(3)),
+                }
+
+            # 是否穿透
+            if "未穿透" in text:
+                d["penetrated"] = False
+
+            layers[layer_id] = d
+            layer_order.append(layer_id)
+
+    result["layers"] = layers
+    result["layer_order"] = layer_order
+    result["layer_count"] = len(layer_order)
+
+    # ================================================================
+    # 4) 物理力学指标表  (12 行 × 8 列, 紧跟 "物理力学指标统计表" 段落)
+    # ================================================================
+    _PARAM_KEYS = [
+        "W", "gamma", "e", "WL", "WP", "IP", "IL", "C", "phi", "a1_2", "Es",
+    ]
+
+    physmech: Dict[str, Dict] = {}
+    used_tbl_set: set = set()
+
+    # 建立 "物理力学指标统计表" 段落在 body 中的位置
+    stat_positions: List[int] = []
+    for i, (_, text) in enumerate(paragraphs):
+        if "物理力学指标统计表" in text:
+            stat_positions.append(i)
+
+    for si, para_i in enumerate(stat_positions):
+        if si >= len(layer_order):
+            break
+        lid = layer_order[si]
+
+        # 找到该段落之后的第一个未使用 phys-mech 表格
+        body_idx = paragraphs[para_i][0]
+        found_tbl = None
+        found_id = None
+        for ti, (tbl_body_idx, tbl) in enumerate(tables):
+            if ti in used_tbl_set:
+                continue
+            if tbl_body_idx <= body_idx:
+                continue
+            if len(tbl.rows) < 12 or len(tbl.columns) < 8:
+                continue
+            # 确认是物理力学表 (第一行 W(%))
+            r1c0 = _cell(tbl, 1, 0)
+            if "W" not in r1c0:
+                continue
+            found_tbl = tbl
+            found_id = ti
+            break
+
+        if found_tbl is None:
+            continue
+
+        used_tbl_set.add(found_id)
+        props: Dict[str, Dict] = {}
+        for row_i in range(1, min(12, len(found_tbl.rows))):
+            param = _cell(found_tbl, row_i, 0)
+            key_idx = row_i - 1
+            key = _PARAM_KEYS[key_idx] if key_idx < len(_PARAM_KEYS) else param
+            props[key] = {
+                "name": param,
+                "min": _bf(_cell(found_tbl, row_i, 1)),
+                "max": _bf(_cell(found_tbl, row_i, 2)),
+                "avg": _bf(_cell(found_tbl, row_i, 3)),
+                "n": _bf(_cell(found_tbl, row_i, 4)),
+                "stddev": _bf(_cell(found_tbl, row_i, 5)),
+                "cv": _bf(_cell(found_tbl, row_i, 6)),
+                "xk": _bf(_cell(found_tbl, row_i, 7)),
+            }
+        physmech[lid] = props
+
+    result["physmech"] = physmech
+
+    # ================================================================
+    # 5) 承载力建议值表  (4 列: 层号, 名称, fak, Es)
+    # ================================================================
+    bearing: Dict[str, Dict] = {}
+    if bearing_heading >= 0:
+        bh_body_idx = paragraphs[bearing_heading][0]
+        for _, tbl in tables:
+            # 找 "各层建议值" 之后的第一个 4 列表格
+            # (简化: 直接找 4 列且含 fak 的表)
+            if len(tbl.columns) != 4:
+                continue
+            h = _cell(tbl, 0, 2).lower()
+            if "fak" not in h and "承载力" not in _cell(tbl, 0, 2):
+                continue
+            for ri in range(1, len(tbl.rows)):
+                lid = _cell(tbl, ri, 0)
+                lname = _cell(tbl, ri, 1)
+                fak_v = _bf(_cell(tbl, ri, 2))
+                es_v = _bf(_cell(tbl, ri, 3))
+                if lid:
+                    bearing[lid] = {
+                        "name": lname,
+                        "fak": fak_v,
+                        "es": es_v,
+                    }
+            break  # 只取第一个匹配的表
+    result["bearing"] = bearing
+
+    # ---- 项目基本信息 ----
+    for _, text in paragraphs[:30]:
+        if text.startswith("工程编号"):
+            result["project_id"] = text.replace("工程编号", "").strip(":： ")
+            break
+
+    logger.info(
+        f"  简报提取: 高程{elv}, 地下水{gw.get('count', 0)}个, "
+        f"{len(layer_order)}层, 物理力学{len(physmech)}层有数据"
+    )
+    return result
+
+
+# ============================================================
+# 建筑-钻孔映射 (DXF 总平面图空间匹配)
+# ============================================================
+
+def _edge_length(p1: Tuple, p2: Tuple) -> float:
+    """计算两点间距离"""
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def _point_in_rect(px: float, py: float,
+                   xmin: float, xmax: float,
+                   ymin: float, ymax: float,
+                   margin: float = 5) -> bool:
+    """判断点是否在矩形范围内 (含 margin 容差)"""
+    return xmin - margin <= px <= xmax + margin and \
+           ymin - margin <= py <= ymax + margin
+
+
+def _extract_outlines(msp: Any, layer_name: str,
+                      x_min: float = 0, min_pts: int = 4,
+                      div: float = 1.0) -> List[Dict]:
+    """从 DXF 模型空间提取建筑物闭合轮廓
+
+    Adapted from cad-building-extract skill:
+    - 使用 LWPOLYLINE 闭合多边形
+    - 实际边长 (非 bounding box), 支持旋转建筑
+    - Shoelace 面积计算
+    - div: 坐标单位转换 (1=米, 1000=毫米→米)
+
+    Returns: list of outline dicts with cx, cy, length, width, area, bbox, pts
+    """
+    outlines = []
+    for e in msp:
+        if e.dxftype() != 'LWPOLYLINE':
+            continue
+        if getattr(e.dxf, 'layer', '') != layer_name:
+            continue
+        try:
+            pts = list(e.get_points(format='xy'))
+        except Exception:
+            continue
+        n = len(pts)
+        if n < min_pts:
+            continue
+
+        # 中心点
+        cx = sum(p[0] for p in pts) / n
+        cy = sum(p[1] for p in pts) / n
+        if cx < x_min:
+            continue
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+
+        # Shoelace 面积
+        area = 0
+        for j in range(n):
+            j1 = (j + 1) % n
+            area += pts[j][0] * pts[j1][1] - pts[j1][0] * pts[j1][1]
+        area = abs(area) / 2 / (div * div)
+
+        # 实际边长 (4点矩形取对边平均, 多边形用 bbox)
+        if n == 4:
+            side1 = (_edge_length(pts[0], pts[1]) + _edge_length(pts[2], pts[3])) / 2 / div
+            side2 = (_edge_length(pts[1], pts[2]) + _edge_length(pts[3], pts[0])) / 2 / div
+            length = max(side1, side2)
+            width = min(side1, side2)
+        else:
+            length = max(max(xs) - min(xs), max(ys) - min(ys)) / div
+            width = min(max(xs) - min(xs), max(ys) - min(ys)) / div
+
+        outlines.append({
+            'cx': cx / div, 'cy': cy / div,
+            'length': length, 'width': width,
+            'area': area, 'npts': n,
+            'xmin': min(xs) / div, 'xmax': max(xs) / div,
+            'ymin': min(ys) / div, 'ymax': max(ys) / div,
+            'pts': [(p[0] / div, p[1] / div) for p in pts],
+            # 保留原始坐标 (未缩放), 用于与钻孔坐标匹配
+            'raw_xmin': min(xs), 'raw_xmax': max(xs),
+            'raw_ymin': min(ys), 'raw_ymax': max(ys),
+            'raw_cx': cx, 'raw_cy': cy,
+        })
+    return outlines
+
+
+def _extract_building_texts(msp: Any, x_min: float = 0) -> List[Dict]:
+    """从 DXF 提取建筑编号标注 (TEXT + MTEXT)
+
+    建筑编号识别规则: 以数字+#开头, 如 1#, 2#, A-1# 等
+    """
+    texts = []
+    for e in msp:
+        etype = e.dxftype()
+        if etype not in ('TEXT', 'MTEXT'):
+            continue
+        try:
+            if etype == 'TEXT':
+                txt = e.dxf.text.strip()
+                x, y = round(e.dxf.insert.x, 2), round(e.dxf.insert.y, 2)
+            else:
+                txt = e.text.strip()
+                # MTEXT: 使用插入点
+                x = round(e.dxf.insert.x, 2)
+                y = round(e.dxf.insert.y, 2)
+        except Exception:
+            continue
+
+        if x < x_min or not txt:
+            continue
+
+        # 建筑编号: 数字+# 或 含字母前缀的编号
+        if re.match(r'^[A-Za-z]*-?\d+#', txt):
+            texts.append({'text': txt, 'x': x, 'y': y})
+    return texts
+
+
+def _auto_detect_dxf_layers(msp: Any) -> Dict[str, str]:
+    """自动检测 DXF 中建筑标注/轮廓图层
+
+    Returns: {"text_layer": str, "outline_layer": str}
+    """
+    layer_info: Dict[str, Dict] = {}
+    for e in msp:
+        layer = getattr(e.dxf, 'layer', '')
+        if not layer:
+            continue
+        if layer not in layer_info:
+            layer_info[layer] = {'count': 0, 'types': set()}
+        layer_info[layer]['count'] += 1
+        layer_info[layer]['types'].add(e.dxftype())
+
+    text_layer = ""
+    outline_layer = ""
+
+    # 文字图层: 含建筑编号标注的图层 (优先含关键词)
+    text_layers = [
+        (n, i) for n, i in layer_info.items()
+        if 'TEXT' in i['types'] or 'MTEXT' in i['types'] and i['count'] > 10
+    ]
+    if text_layers:
+        preferred = [
+            x for x in text_layers
+            if any(kw in x[0] for kw in ['住宅', '建筑', '标注', '指标'])
+        ]
+        text_layer = (max(preferred, key=lambda x: x[1]['count'])
+                      if preferred
+                      else max(text_layers, key=lambda x: x[1]['count']))[0]
+
+    # 轮廓图层: 含 LWPOLYLINE 的图层 (优先含关键词)
+    outline_layers = [
+        (n, i) for n, i in layer_info.items()
+        if 'LWPOLYLINE' in i['types']
+    ]
+    if outline_layers:
+        preferred = [
+            x for x in outline_layers
+            if any(kw in x[0] for kw in ['地上', '轮廓', '建筑', '住宅'])
+        ]
+        outline_layer = (max(preferred, key=lambda x: x[1]['count'])
+                         if preferred
+                         else max(outline_layers, key=lambda x: x[1]['count']))[0]
+
+    return {"text_layer": text_layer, "outline_layer": outline_layer}
+
+
+def _detect_coord_div(msp: Any) -> float:
+    """检测坐标单位转换因子
+
+    规则: 建筑编号标注 X 坐标中位数 <1M → 米 (div=1), >1M → 毫米 (div=1000)
+    """
+    building_xs = []
+    for e in msp:
+        try:
+            if e.dxftype() == 'TEXT' and '#' in (e.dxf.text or ''):
+                building_xs.append(e.dxf.insert.x)
+            elif e.dxftype() == 'MTEXT' and '#' in (e.text or ''):
+                building_xs.append(e.dxf.insert.x)
+        except Exception:
+            continue
+
+    if not building_xs:
+        return 1.0
+
+    median_x = sorted(building_xs)[len(building_xs) // 2]
+    return 1000.0 if median_x > 1_000_000 else 1.0
+
+
+def _match_outline(bx: float, by: float, outlines: List[Dict],
+                   used: set, max_dist: float = 50,
+                   min_area: float = 60) -> Optional[Dict]:
+    """为建筑编号标注匹配最佳轮廓
+
+    优先级: 标注点在轮廓内 > 面积最大 > 距离最近
+    """
+    candidates = []
+    for idx, o in enumerate(outlines):
+        if idx in used:
+            continue
+        if o['area'] < min_area:
+            continue
+        d = math.sqrt((bx - o['raw_cx']) ** 2 + (by - o['raw_cy']) ** 2)
+        inside = _point_in_rect(bx, by,
+                                o['raw_xmin'], o['raw_xmax'],
+                                o['raw_ymin'], o['raw_ymax'], margin=10)
+        if d < max_dist:
+            candidates.append((idx, d, o, inside))
+
+    if not candidates:
+        return None
+
+    # 优先: inside > larger area > closer distance
+    candidates.sort(key=lambda x: (not x[3], -x[2]['area'], x[1]))
+    best_idx = candidates[0][0]
+    used.add(best_idx)
+    return candidates[0][2]
+
+
+def extract_building_borehole_mapping(
+    dxf_path: str,
+    borehole_coords: Dict[str, Tuple[float, float]],
+    building_info_path: str = "",
+    text_layer: str = "",
+    outline_layer: str = "",
+) -> Dict[str, Any]:
+    """从 DXF 总平面图提取建筑-钻孔空间映射
+
+    工作流程 (adapted from cad-building-extract skill):
+    1. 读取 DXF, 自动检测图层和坐标单位
+    2. 提取建筑编号标注和轮廓
+    3. 匹配编号→轮廓 (标注点在轮廓内优先)
+    4. 加载建筑信息 JSON (补充层数/尺寸/标高)
+    5. 将钻孔坐标与建筑轮廓矩形做空间匹配
+
+    Parameters
+    ----------
+    dxf_path : str
+        DXF 总平面图文件路径
+    borehole_coords : dict
+        {bh_id: (X, Y)} 钻孔坐标, 来自 DK 文件
+    building_info_path : str, optional
+        建筑信息 JSON 文件路径 (含层数/尺寸/标高等)
+    text_layer : str, optional
+        手动指定文字标注图层名
+    outline_layer : str, optional
+        手动指定建筑轮廓图层名
+
+    Returns
+    -------
+    dict
+        {
+            "available": True,
+            "buildings": {
+                "1#": {
+                    "name": "1#",
+                    "json_name": "A-1#",
+                    "floors": 17,
+                    "elev": 25.3,
+                    "dim": "62.93×50.80",
+                    "outline": {"xmin": ..., "xmax": ..., "ymin": ..., "ymax": ...},
+                    "boreholes": [{"bh_id": "22", "distance": 8.4}, ...],
+                    "bh_count": 14,
+                },
+                ...
+            },
+            "unmatched_boreholes": ["bh1", "bh2", ...],
+            "total_buildings": 21,
+            "total_matched_boreholes": 162,
+        }
+    """
+    if not dxf_path or not os.path.isfile(dxf_path):
+        return {"available": False}
+
+    # 导入 ezdxf
+    try:
+        import ezdxf
+    except ImportError:
+        logger.warning("  DXF 提取需要 ezdxf 库: pip install ezdxf")
+        return {"available": False}
+
+    # 读取 DXF (多编码尝试)
+    doc = None
+    for enc in ('gbk', 'utf-8', 'gb2312', 'gb18030'):
+        try:
+            doc = ezdxf.readfile(dxf_path, encoding=enc)
+            break
+        except Exception:
+            continue
+
+    if doc is None:
+        logger.warning(f"  无法读取 DXF 文件: {dxf_path}")
+        return {"available": False}
+
+    msp = doc.modelspace()
+
+    # 自动检测图层和坐标单位
+    detected = _auto_detect_dxf_layers(msp)
+    if not text_layer:
+        text_layer = detected.get("text_layer", "")
+    if not outline_layer:
+        outline_layer = detected.get("outline_layer", "")
+
+    div = _detect_coord_div(msp)
+
+    logger.info(f"  DXF 图层: text={text_layer}, outline={outline_layer}, div={div}")
+
+    # 提取建筑编号标注
+    x_min_filter = 0
+    bldg_texts = _extract_building_texts(msp, x_min_filter)
+    logger.info(f"  建筑编号标注: {len(bldg_texts)} 个")
+
+    # 提取建筑轮廓
+    outlines = _extract_outlines(msp, outline_layer, x_min_filter, min_pts=4, div=div) \
+               if outline_layer else []
+    logger.info(f"  建筑轮廓: {len(outlines)} 个")
+
+    # 加载建筑信息 JSON (补充层数/尺寸等)
+    building_info: Dict[str, Dict] = {}
+    if building_info_path and os.path.isfile(building_info_path):
+        try:
+            with open(building_info_path, 'r', encoding='utf-8') as f:
+                binfo_raw = json.load(f)
+            # buildings 列表 → dict keyed by name
+            for b in binfo_raw.get("buildings", []):
+                building_info[b.get("name", "")] = b
+            logger.info(f"  建筑信息 JSON: {len(building_info)} 栋")
+        except Exception as e:
+            logger.warning(f"  建筑信息 JSON 读取失败: {e}")
+
+    # 匹配编号 → 轮廓
+    used_outlines: set = set()
+    buildings: Dict[str, Dict] = {}
+
+    # 按编号排序
+    bldg_texts.sort(
+        key=lambda b: int(re.match(r'(\d+)', b['text']).group(1))
+        if re.match(r'(\d+)', b['text']) else 999
+    )
+
+    for bn in bldg_texts:
+        bname = bn['text']
+        # 去掉字母前缀 (如 A-1# → 1#) 用于内部 key
+        inner_key = re.sub(r'^[A-Za-z]-', '', bname)
+
+        # 匹配轮廓
+        outline = _match_outline(bn['x'], bn['y'], outlines, used_outlines,
+                                 max_dist=100, min_area=30)
+
+        # 构建建筑数据
+        bdata: Dict[str, Any] = {
+            "name": bname,
+            "label_x": bn['x'],
+            "label_y": bn['y'],
+        }
+
+        # 轮廓信息
+        if outline:
+            bdata["outline"] = {
+                "xmin": outline['raw_xmin'],
+                "xmax": outline['raw_xmax'],
+                "ymin": outline['raw_ymin'],
+                "ymax": outline['raw_ymax'],
+                "cx": outline['raw_cx'],
+                "cy": outline['raw_cy'],
+                "length": outline['length'],
+                "width": outline['width'],
+                "area": outline['area'],
+            }
+        else:
+            bdata["outline"] = None
+
+        # 补充建筑信息 JSON 数据
+        # JSON name 可能带字母前缀 (A-1#), 而 DXF 标注可能是 1#
+        json_match = building_info.get(bname) or building_info.get(inner_key) or \
+                     building_info.get(f"A-{inner_key}") or building_info.get(f"B-{inner_key}")
+        if json_match:
+            bdata["json_name"] = json_match.get("name", "")
+            bdata["floors"] = json_match.get("floors", 0)
+            bdata["elev"] = json_match.get("elev", 0)
+            bdata["dim"] = json_match.get("dim", "")
+        elif outline:
+            bdata["floors"] = 0
+            bdata["elev"] = 0
+            bdata["dim"] = f"{outline['length']:.2f}×{outline['width']:.2f}"
+
+        # 空间匹配钻孔
+        #   策略: 使用建筑标注坐标 + 建筑信息尺寸构建虚拟矩形
+        #         DXF 轮廓仅在面积合理时作为补充参考
+        bh_list: List[Dict] = []
+        if borehole_coords:
+            # 确定匹配范围:
+            #   优先用建筑信息尺寸建虚拟矩形 (标注坐标为中心)
+            #   DXF 轮廓仅在面积 >= 建筑信息面积 50% 时使用
+            ocx = bn['x']
+            ocy = bn['y']
+
+            # 从 dim 字符串中解析长宽 (来自建筑信息 JSON)
+            half_w = 0
+            half_h = 0
+            dim_str = bdata.get("dim", "")
+            if dim_str:
+                try:
+                    parts = dim_str.replace("x", "×").split("×")
+                    half_w = float(parts[0]) / 2
+                    half_h = float(parts[1]) / 2
+                except Exception:
+                    pass
+
+            # 评估 DXF 轮廓是否可用 (面积应 >= 建筑信息面积 50%)
+            outline = bdata.get("outline")
+            use_outline = False
+            if outline and half_w > 0 and half_h > 0:
+                # 计算建筑信息面积
+                expected_area = (half_w * 2) * (half_h * 2)
+                outline_area = outline.get("area", 0)
+                # DXF 轮廓面积 (需考虑 div 转换)
+                # 如果 outline 面积太小 (<50%), 说明轮廓不是建筑主体
+                if outline_area >= expected_area * 0.5:
+                    use_outline = True
+                    ocx = outline["cx"]
+                    ocy = outline["cy"]
+
+            # 默认尺寸 (无建筑信息时)
+            if not half_w:
+                half_w = 20
+            if not half_h:
+                half_h = 20
+
+            # 构建匹配矩形 (DXF 原始坐标)
+            oxmin = ocx - half_w * div
+            oxmax = ocx + half_w * div
+            oymin = ocy - half_h * div
+            oymax = ocy + half_h * div
+            outline_max_dim = max(half_w, half_h) * 2
+
+            # 钻孔匹配: 在矩形内 (含 margin)
+            # margin = 轮廓半宽 * 15% + 3m (确保边角钻孔也被捕获)
+            margin = outline_max_dim * 0.15 + 3
+
+            for bh_id, (bx, by) in borehole_coords.items():
+                d = math.sqrt((bx - ocx) ** 2 + (by - ocy) ** 2)
+                if _point_in_rect(bx, by, oxmin, oxmax, oymin, oymax, margin=margin):
+                    bh_list.append({"bh_id": bh_id, "distance": round(d, 1)})
+
+            # 按距离排序
+            bh_list.sort(key=lambda x: x["distance"])
+
+        bdata["boreholes"] = bh_list
+        bdata["bh_count"] = len(bh_list)
+        buildings[inner_key] = bdata
+
+    # 统计未匹配钻孔
+    matched_ids: set = set()
+    for bdata in buildings.values():
+        for bh in bdata["boreholes"]:
+            matched_ids.add(bh["bh_id"])
+
+    unmatched = [bh_id for bh_id in borehole_coords if bh_id not in matched_ids]
+
+    result = {
+        "available": True,
+        "buildings": buildings,
+        "unmatched_boreholes": unmatched,
+        "total_buildings": len(buildings),
+        "total_matched_boreholes": len(matched_ids),
+        "dxf_path": dxf_path,
+    }
+
+    logger.info(
+        f"  建筑映射: {len(buildings)} 栋建筑, "
+        f"{len(matched_ids)} 个钻孔已分配, "
+        f"{len(unmatched)} 个未分配"
+    )
+    return result
+
+
+def extract_borehole_coords_from_dxf(
+    dxf_path: str,
+    hn_coords: Dict[str, Tuple[float, float]] = None,
+) -> Dict[str, Tuple[float, float]]:
+    """从 DXF 平面图直接提取钻孔坐标
+
+    从 DXF 的勘探点图层提取 INSERT 块的插入点坐标作为钻孔位置。
+    INSERT 块通常表示钻孔符号（圆环、十字等），其插入点即为钻孔中心。
+
+    如果提供 hn_coords (华宁 DB 坐标)，则按坐标距离匹配编号；
+    否则用 DXF 上的 TEXT 标注作为钻孔编号。
+
+    Parameters
+    ----------
+    dxf_path : str
+        DXF 平面图文件路径
+    hn_coords : dict, optional
+        华宁 DB 的钻孔坐标 {bh_id: (X, Y)}, 用于编号匹配
+
+    Returns
+    -------
+    dict
+        {bh_id: (X, Y)} 钻孔编号→坐标映射
+    """
+    if not dxf_path or not os.path.isfile(dxf_path):
+        return {}
+
+    try:
+        import ezdxf
+    except ImportError:
+        logger.warning("  DXF 提取需要 ezdxf 库: pip install ezdxf")
+        return {}
+
+    # 读取 DXF
+    doc = None
+    for enc in ('gbk', 'utf-8', 'gb2312', 'gb18030'):
+        try:
+            doc = ezdxf.readfile(dxf_path, encoding=enc)
+            break
+        except Exception:
+            continue
+
+    if doc is None:
+        logger.warning(f"  无法读取 DXF 文件: {dxf_path}")
+        return {}
+
+    msp = doc.modelspace()
+
+    # Step 1: 找勘探点图层 (含最多纯数字 TEXT 标注的图层)
+    layer_digits: Dict[str, int] = {}
+    for e in msp:
+        if e.dxftype() != 'TEXT':
+            continue
+        try:
+            txt = e.dxf.text.strip()
+            layer = getattr(e.dxf, 'layer', '')
+            if txt.isdigit() and 1 <= int(txt) <= 999:
+                layer_digits[layer] = layer_digits.get(layer, 0) + 1
+        except Exception:
+            continue
+
+    if not layer_digits:
+        return {}
+
+    bh_layer = max(layer_digits.items(), key=lambda x: x[1])[0]
+
+    # Step 2: 提取该图层上的 INSERT 块 (钻孔符号)
+    inserts: List[Tuple[float, float]] = []
+    for e in msp:
+        if e.dxftype() != 'INSERT':
+            continue
+        if getattr(e.dxf, 'layer', '') != bh_layer:
+            continue
+        try:
+            x = round(e.dxf.insert.x, 2)
+            y = round(e.dxf.insert.y, 2)
+            inserts.append((x, y))
+        except Exception:
+            continue
+
+    # Step 3: 提取该图层上的 TEXT 标注 (钻孔编号)
+    texts: List[Tuple[str, float, float]] = []
+    for e in msp:
+        if e.dxftype() != 'TEXT':
+            continue
+        if getattr(e.dxf, 'layer', '') != bh_layer:
+            continue
+        try:
+            txt = e.dxf.text.strip()
+            if not txt.isdigit():
+                continue
+            x = round(e.dxf.insert.x, 2)
+            y = round(e.dxf.insert.y, 2)
+            texts.append((txt, x, y))
+        except Exception:
+            continue
+
+    # Step 4: 确定钻孔坐标和编号
+    coords: Dict[str, Tuple[float, float]] = {}
+
+    if hn_coords and inserts:
+        # 有华宁 DB 坐标: 按坐标距离匹配 INSERT → 华宁编号
+        used_hn: set = set()
+        for ix, iy in inserts:
+            min_dist = float('inf')
+            best_id = None
+            for hn_id, (hx, hy) in hn_coords.items():
+                if hn_id in used_hn:
+                    continue
+                d = math.sqrt((ix - hx) ** 2 + (iy - hy) ** 2)
+                if d < min_dist:
+                    min_dist = d
+                    best_id = hn_id
+            if best_id and min_dist < 5.0:  # 5m 容差
+                coords[best_id] = (ix, iy)
+                used_hn.add(best_id)
+    elif inserts and texts:
+        # 无华宁 DB: 用 TEXT 标注编号匹配最近的 INSERT
+        used_ins: set = set()
+        for txt, tx, ty in texts:
+            min_dist = float('inf')
+            best_idx = -1
+            for i, (ix, iy) in enumerate(inserts):
+                if i in used_ins:
+                    continue
+                d = math.sqrt((tx - ix) ** 2 + (ty - iy) ** 2)
+                if d < min_dist:
+                    min_dist = d
+                    best_idx = i
+            if best_idx >= 0 and min_dist < 30:  # 30m 容差 (文字可能离得远)
+                coords[txt] = inserts[best_idx]
+                used_ins.add(best_idx)
+    elif inserts:
+        # 只有 INSERT 没有 TEXT: 自动编号 1, 2, 3...
+        for i, (ix, iy) in enumerate(inserts, 1):
+            coords[str(i)] = (ix, iy)
+
+    logger.info(
+        f"  DXF 钻孔: 图层 '{bh_layer}', "
+        f"{len(inserts)} 个 INSERT, {len(texts)} 个 TEXT, "
+        f"提取 {len(coords)} 个坐标"
+    )
+    return coords
+
 
 
 # ============================================================
@@ -3470,10 +4678,66 @@ class ReportFiller:
         if not sc:
             return
 
-        # 高程统计 (自动注入)
+        # 高程统计 (自动注入, 优先简报 → Excel → 华宁 DK)
         bh_info = self.data.get("borehole_info", {})
         elv_min = fmt_val(bh_info.get("elv_min"))
         elv_max = fmt_val(bh_info.get("elv_max"))
+
+        # 简报高程 (优先)
+        briefing = self.data.get("briefing", {})
+        bf_elv = briefing.get("elevation", {}) if briefing.get("available") else {}
+        if not elv_min and bf_elv:
+            elv_min = fmt_val(bf_elv.get("min"))
+            elv_max = fmt_val(bf_elv.get("max"))
+
+        # 华宁 DK 文件高程回退
+        hn_data = self.data.get("hn_data", {})
+        hn_elv = hn_data.get("elevation", {}) if hn_data else {}
+        if not elv_min and hn_elv:
+            elv_min = fmt_val(hn_elv.get("elv_min"))
+            elv_max = fmt_val(hn_elv.get("elv_max"))
+
+        # 地貌类型自动判定 (优先简报高差, 回退 DK; 地层名称优先简报)
+        auto_terrain = ""
+        elv_range = 0.0
+        if bf_elv and bf_elv.get("range"):
+            elv_range = bf_elv["range"]
+        elif hn_elv:
+            elv_range = hn_elv.get("elv_range", 0.0)
+
+        # 简报中已填写地貌类型则直接使用
+        if bf_elv.get("terrain_type"):
+            auto_terrain = bf_elv["terrain_type"]
+        elif elv_range > 0 or (hn_data and hn_data.get("available")):
+            origins = set()
+            layer_names = []
+            # 简报中的地层名称
+            if briefing.get("available") and briefing.get("layers"):
+                for lid, info in briefing["layers"].items():
+                    layer_names.append(info.get("name", ""))
+            # DCSH 中的成因 (优先, 精确)
+            if hn_data and hn_data.get("available"):
+                for rec in hn_data.get("layer_sequence", []):
+                    o = rec.get("origin", "")
+                    if o and not o.isdigit():
+                        origins.add(o)
+                if not layer_names:
+                    for lid, info in hn_data.get("descriptions", {}).items():
+                        if isinstance(info, dict):
+                            layer_names.append(info.get("name", ""))
+            # 无 DCSH 成因时, 从简报地层名推断
+            if not origins and briefing.get("available") and briefing.get("layers"):
+                origins = HuaNingDBReader.infer_origins_from_names(
+                    briefing["layers"]
+                )
+            auto_terrain = HuaNingDBReader.determine_terrain(
+                elv_range, origins, layer_names
+            )
+            if auto_terrain:
+                logger.info(
+                    f"  地貌自动判定: {auto_terrain} "
+                    f"(高差{elv_range:.1f}m, 成因{origins})"
+                )
 
         # 液化自动判断
         liq_data, liq_liq, liq_non = self.data.get("liquefaction", ([], 0, 0))
@@ -3530,6 +4794,11 @@ class ReportFiller:
 
             for keywords, config_key in triggers:
                 config_text = sc.get(config_key, "")
+
+                # 地貌: config 为空时使用自动判定结果
+                if config_key == "terrain_text" and not config_text and auto_terrain:
+                    config_text = f"场区地貌类型属{auto_terrain}。"
+
                 if not config_text:
                     continue
                 if any(kw in txt for kw in keywords):
@@ -4329,6 +5598,43 @@ def main() -> None:
     elif hn_db_dir:
         logger.warning(f"  华宁数据库目录不存在: {hn_db_dir}")
 
+    # 简报 (华宁生成的 .docx, 提取高程/地下水/地层等)
+    briefing_data: Dict[str, Any] = {}
+    sj_dir = config.get_sj_dir()
+    if sj_dir:
+        logger.info(f"\n[简报] 搜索目录: {sj_dir}")
+        briefing_data = read_briefing(sj_dir)
+
+    # 建筑-钻孔映射 (DXF 总平面图空间匹配)
+    building_bh_mapping: Dict[str, Any] = {"available": False}
+    dxf_path = config.get_dxf_path()
+    building_info_path = config.get_building_info_path()
+    borehole_coords_hn = (hn_data.get("borehole_coords", {})
+                          if hn_data.get("available") else {})
+    # 优先从 DXF INSERT 块获取钻孔坐标 (图面精确位置)
+    borehole_coords: Dict[str, Tuple[float, float]] = {}
+    if dxf_path:
+        borehole_coords = extract_borehole_coords_from_dxf(
+            dxf_path, hn_coords=borehole_coords_hn or None)
+        if borehole_coords:
+            src = "INSERT→华宁匹配" if borehole_coords_hn else "INSERT/TEXT"
+            logger.info(f"  钻孔坐标从 DXF 提取 ({src}, {len(borehole_coords)} 个)")
+    # DXF 无结果时回退到华宁 DK 坐标
+    if not borehole_coords and borehole_coords_hn:
+        borehole_coords = borehole_coords_hn
+        logger.info(f"  钻孔坐标使用华宁 DK ({len(borehole_coords)} 个)")
+    if dxf_path and borehole_coords:
+        logger.info(f"\n[建筑映射] DXF: {dxf_path}")
+        if building_info_path:
+            logger.info(f"  建筑信息: {building_info_path}")
+        building_bh_mapping = extract_building_borehole_mapping(
+            dxf_path, borehole_coords, building_info_path,
+            text_layer=config.raw.get("dxf_text_layer", ""),
+            outline_layer=config.raw.get("dxf_outline_layer", ""),
+        )
+    elif dxf_path:
+        logger.info(f"\n[建筑映射] DXF 存在但无钻孔坐标数据")
+
     if args.dry_run:
         logger.info("\n[Dry-run] 数据加载完成，不生成报告。")
         return
@@ -4350,6 +5656,8 @@ def main() -> None:
         "water_samples": water_samples,
         "salt_samples": salt_samples,
         "hn_data": hn_data,
+        "briefing": briefing_data,
+        "building_bh_mapping": building_bh_mapping,
     }
 
     filler = ReportFiller(
