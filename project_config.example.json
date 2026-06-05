@@ -17,6 +17,8 @@
     "foundation_grade": "一级",
     "survey_grade": "甲级",
     "frozen_depth": "0.50m",
+    "_comment_db_foundation": "基础埋深 (m), 用于液化判别初判条件(3)计算, 默认1.5",
+    "db_foundation_depth": 1.5,
     "_comment_has_basement": "是否有地下室/基坑 (影响任务要求和基坑章节), 不填则从建筑物数据自动检测",
     "has_basement": true
   },
@@ -30,6 +32,12 @@
     "Q4|ml": "第四系人工堆积层（Q4ml）",
     "Q4|al+pl": "第四系冲洪积层（Q4al+pl）",
     "Q4|dl+el": "第四系残积层（Q4el）"
+  },
+
+  "_comment_seismic": "地震动参数: 从 GB18306-2015 附录C.15 自动查表, 只需填写 district + town。pga/period/intensity/group 全部自动得出, 也可手动覆盖任意字段。",
+  "seismic": {
+    "district": "环翠区",
+    "town": "怡园街道"
   },
 
   "_comment_table_indices": "docx 中表格的序号索引 (从 0 开始), 不同模板可能需要调整",
@@ -168,14 +176,14 @@
     "9": { "name": "中粗砂", "default_result": "不液化" }
   },
 
-  "_comment_site_conditions": "第五章 场地条件: 各子节文字配置, 支持占位符 {elv_min} {elv_max} {liquefaction_result}",
+  "_comment_site_conditions": "第五章 场地条件: 各子节文字配置, 支持占位符 {elv_min} {elv_max} {liquefaction_result} {site_location} {pga} {period} {intensity} {group}",
   "site_conditions": {
     "terrain_text": "勘察场地位于胶东半岛低山丘陵区，所处地貌单元为丘陵。",
     "topography_text": "拟建场地整体地形地势南高北低，东西高中间低。地面标高最大值{elv_max}m,最小值{elv_min}m,地表相对高差较大(根据钻孔统计)。",
     "environment_text": "拟建场区东南西北侧为现状道路，南侧距离建筑红线约15m，北侧距离建筑红线约32.5m，东侧距离建筑红线约15.2m，西侧距离建筑红线约20m。",
     "surface_water_text": "拟建场地及附近无大的地表水体。",
-    "seismic_params_text": "拟建场地按《中国地震动参数区划图》(GB18306-2015)附录C，II类场地设计基本地震动峰值加速度为0.10g、设计基本地震动峰值加速度反应谱特征周期0.35s。根据《建筑与市政工程抗震通用规范》(GB55002-2021)2.2.2，对应的抗震设防烈度为7度、设计地震分组为第三组。",
-    "site_class_text": "经场地现场测试，建议场地整体按Ⅱ类场地考虑，设计特征周期0.35s。",
+    "seismic_params_text": "{site_location}按《中国地震动参数区划图》(GB18306-2015)附录C，II类场地设计基本地震动峰值加速度为{pga}g、设计基本地震动峰值加速度反应谱特征周期{period}s。根据《建筑与市政工程抗震通用规范》(GB55002-2021)2.2.2，对应的抗震设防烈度为{intensity}度、设计地震分组为{group}。",
+    "site_class_text": "经场地现场测试，建议场地整体按Ⅱ类场地考虑，设计特征周期{period}s。",
     "seismic_stability_text": "场地不存在地震时发生液化、震陷、横向扩展、崩塌及滑坡等的可能，地震稳定性较好。",
     "seismic_zone_text": "本场地不属于稳定基岩、坚硬土及开阔、平坦、密实、均匀的中硬土，不存在地震时发生滑坡、崩塌、地陷、地裂、泥石流及发震断裂带等不良地质作用的可能，无液化及软土震陷，建议按对建筑抗震一般地段考虑。",
     "soft_soil_text": "场地地层深度内未揭露软土。",

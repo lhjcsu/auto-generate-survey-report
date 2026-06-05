@@ -36,6 +36,12 @@ import sys
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
+# 地震参数查表 (GB 18306-2015 附录 C.15)
+try:
+    from seismic_lookup import get_seismic_params as _lookup_seismic
+except ImportError:
+    _lookup_seismic = None  # type: ignore
+
 # 第三方依赖: 延迟导入以支持 --help 在未安装依赖时仍可运行
 try:
     import openpyxl
@@ -481,6 +487,42 @@ class ProjectConfig:
     def get_hn_project_code(self) -> str:
         """获取华宁项目代码"""
         return self.raw.get("hn_project_code", "")
+
+    def get_seismic_params(self) -> Dict[str, str]:
+        """
+        获取地震动参数 (自动查表 + config覆盖)。
+
+        config 中 seismic 节:
+            { "district": "环翠区", "town": "怡园街道" }
+        自动从 GB 18306-2015 附录C.15 查出 pga/period/intensity/group。
+        也可在 config 中直接覆盖任意字段 (如 {"pga": "0.15"})。
+        """
+        seismic_cfg = self.raw.get("seismic", {})
+        if not seismic_cfg:
+            return {}
+
+        district = seismic_cfg.get("district", "")
+        town = seismic_cfg.get("town", "")
+
+        # 先查表
+        result: Dict[str, str] = {}
+        if _lookup_seismic and district and town:
+            looked = _lookup_seismic(district, town)
+            if looked:
+                result.update(looked)
+                logger.info(f"  地震参数查表: {district} {town} → "
+                            f"PGA={looked['pga']}g, T={looked['period']}s, "
+                            f"烈度={looked['intensity']}度, 分组={looked['group']}")
+            else:
+                logger.warning(f"  地震参数查表: {district} {town} 未找到, "
+                               f"请检查 seismic.district 和 seismic.town 配置")
+
+        # config 中的显式值覆盖查表结果 (允许部分覆盖)
+        for key in ("pga", "period", "intensity", "group"):
+            if key in seismic_cfg:
+                result[key] = str(seismic_cfg[key])
+
+        return result
 
 
 # ============================================================
@@ -1300,7 +1342,342 @@ class HuaNingDBReader:
 
         return result
 
+    # ---- 液化判别表 (XLS) ----
+
+    # 抗震设防烈度 → 标贯击数基准值 N0 (GB/T50011-2010 表4.3.4)
+    INTENSITY_TO_N0 = {6: 5, 7: 7, 8: 10, 9: 16}
+
+    # 抗震设防烈度 → 液化土特征深度 d0 (m) (GB/T50011-2010 表4.3.3)
+    INTENSITY_TO_D0 = {6: 6, 7: 7, 8: 8, 9: 9}
+
+    def read_liquefaction_table(self) -> Dict[str, Any]:
+        """读取 sj 目录下的液化判别表 XLS
+
+        返回:
+        {
+            "available": True/False,
+            "intensity": 7,             # 抗震设防烈度
+            "n0": 7,                    # 标贯击数基准值
+            "max_depth": 20,            # 判别最大深度
+            "design_group": "第一组",
+            "beta": 0.8,               # 调整系数
+            "points": [...],           # 逐点数据
+            "total_points": 23,
+            "liq_points": 0,
+            "non_liq_points": 23,
+            "target_layers": ["2"],     # 被判别的层号集合
+            "target_names": ["含黏性土砂"],
+            "dw_values": [1.0],        # 水位深度 (去重)
+            "ile_max": 0.0,            # 最大液化指数
+        }
+        """
+        result: Dict[str, Any] = {"available": False}
+
+        # 查找液化判别表 XLS
+        liq_path = find_file(self.db_dir, "液化判别")
+        if not liq_path:
+            return result
+
+        try:
+            wb = xlrd.open_workbook(liq_path)
+        except Exception as e:
+            logger.warning(f"    液化判别表读取失败: {e}")
+            return result
+
+        ws = wb.sheet_by_index(0)
+        if ws.nrows < 10:
+            return result
+
+        # ---- 解析表头参数 (第3行) ----
+        header_text = str(ws.cell(3, 0).value) if ws.nrows > 3 else ""
+        for c in range(1, min(20, ws.ncols)):
+            v = ws.cell(3, c).value
+            if v:
+                header_text += " " + str(v)
+
+        intensity = 7
+        m = re.search(r"(\d+)\s*度", header_text)
+        if m:
+            intensity = int(m.group(1))
+
+        n0 = self.INTENSITY_TO_N0.get(intensity, 7)
+        m = re.search(r"N0[:\s]*(\d+)", header_text)
+        if m:
+            n0 = int(m.group(1))
+
+        max_depth = 20
+        m = re.search(r"(\d+)\s*米", header_text)
+        if m:
+            max_depth = int(m.group(1))
+
+        design_group = ""
+        m = re.search(r"(第[一二三]组)", header_text)
+        if m:
+            design_group = m.group(1)
+
+        beta = 0.8
+        m = re.search(r"[βΒ]\s*[:\s]*\s*([\d.]+)", header_text)
+        if m:
+            beta = float(m.group(1))
+
+        # ---- 解析数据行 ----
+        points: List[Dict[str, Any]] = []
+        liq_count = 0
+        # 用有序字典保持 layer_id → soil_name 的对应关系
+        target_layer_map: Dict[str, str] = {}
+        dw_values: set = set()
+        current_bh = ""
+
+        for r in range(10, ws.nrows):
+            # 孔号
+            bh_cell = str(ws.cell(r, 0).value).strip() if ws.cell(r, 0).value else ""
+            if bh_cell:
+                current_bh = bh_cell
+
+            # 层号
+            layer_cell = str(ws.cell(r, 1).value).strip() if ws.cell(r, 1).value else ""
+            if not layer_cell:
+                continue  # 跳过空行
+
+            # 试验深度
+            depth_str = str(ws.cell(r, 2).value).strip() if ws.cell(r, 2).value else ""
+
+            # 岩土名称
+            soil_name = str(ws.cell(r, 3).value).strip() if ws.cell(r, 3).value else ""
+
+            # 地下水位 dW
+            try:
+                dw = float(ws.cell(r, 4).value) if ws.cell(r, 4).value else None
+            except (ValueError, TypeError):
+                dw = None
+            if dw is not None:
+                dw_values.add(dw)
+
+            # 黏粒含量
+            try:
+                clay = float(ws.cell(r, 5).value) if ws.cell(r, 5).value else 3.0
+            except (ValueError, TypeError):
+                clay = 3.0
+
+            # 实测N
+            try:
+                n_val = float(ws.cell(r, 6).value) if ws.cell(r, 6).value else None
+            except (ValueError, TypeError):
+                n_val = None
+
+            # 修正N1
+            try:
+                n1_val = float(ws.cell(r, 7).value) if ws.cell(r, 7).value else None
+            except (ValueError, TypeError):
+                n1_val = None
+
+            # 临界Ncr
+            try:
+                ncr = float(ws.cell(r, 8).value) if ws.cell(r, 8).value else None
+            except (ValueError, TypeError):
+                ncr = None
+
+            # 判别结果
+            verdict = str(ws.cell(r, 9).value).strip() if ws.cell(r, 9).value else ""
+
+            is_liq = "液" in verdict and "不" not in verdict
+            if is_liq:
+                liq_count += 1
+
+            # N/Ncr 比值
+            try:
+                n_ncr = float(ws.cell(r, 16).value) if ws.ncols > 16 and ws.cell(r, 16).value else None
+            except (ValueError, TypeError):
+                n_ncr = None
+
+            # 液化指数 ILEi (单点) 和 ILE (钻孔累计)
+            try:
+                ile_i = float(ws.cell(r, 13).value) if ws.ncols > 13 and ws.cell(r, 13).value else None
+            except (ValueError, TypeError):
+                ile_i = None
+            try:
+                ile_cum = float(ws.cell(r, 14).value) if ws.ncols > 14 and ws.cell(r, 14).value else None
+            except (ValueError, TypeError):
+                ile_cum = None
+
+            # 液化等级 (轻微/中等/严重, 仅出现在钻孔最后一个液化点)
+            liq_grade = str(ws.cell(r, 15).value).strip() if ws.ncols > 15 and ws.cell(r, 15).value else ""
+
+            if layer_cell and layer_cell not in target_layer_map and soil_name:
+                target_layer_map[layer_cell] = soil_name
+
+            points.append({
+                "borehole_id": current_bh,
+                "layer_id": layer_cell,
+                "depth_range": depth_str,
+                "soil_name": soil_name,
+                "dw": dw,
+                "clay_content": clay,
+                "n_measured": n_val,
+                "n_corrected": n1_val,
+                "n_critical": ncr,
+                "is_liquefied": is_liq,
+                "verdict": verdict,
+                "n_ncr_ratio": n_ncr,
+                "ile_i": ile_i,
+                "ile_cum": ile_cum,
+                "liq_grade": liq_grade,
+            })
+
+        if not points:
+            return result
+
+        # ---- 汇总统计 ----
+
+        # N/Ncr 范围 (全部判别点)
+        ncr_ratios = [p["n_ncr_ratio"] for p in points if p["n_ncr_ratio"] is not None]
+        ncr_min = min(ncr_ratios) if ncr_ratios else None
+        ncr_max = max(ncr_ratios) if ncr_ratios else None
+
+        # 每孔累计液化指数 ILE (取 col[14] 最大值作为该孔 ILE)
+        bh_ile: Dict[str, float] = {}
+        for p in points:
+            if p["ile_cum"] is not None and p["borehole_id"]:
+                bh_id = p["borehole_id"]
+                bh_ile[bh_id] = max(bh_ile.get(bh_id, 0.0), p["ile_cum"])
+
+        # 全场最大 ILE
+        ile_max = max(bh_ile.values()) if bh_ile else 0.0
+
+        # 液化等级 (按最大 ILE 判定: ≤6轻微, 6~18中等, >18严重)
+        if ile_max <= 0:
+            liq_grade_overall = ""
+        elif ile_max <= 6:
+            liq_grade_overall = "轻微"
+        elif ile_max <= 18:
+            liq_grade_overall = "中等"
+        else:
+            liq_grade_overall = "严重"
+
+        # 各孔液化等级分布
+        grade_dist: Dict[str, int] = {}
+        for bh_id, ile_val in bh_ile.items():
+            if ile_val <= 0:
+                continue
+            if ile_val <= 6:
+                g = "轻微"
+            elif ile_val <= 18:
+                g = "中等"
+            else:
+                g = "严重"
+            grade_dist[g] = grade_dist.get(g, 0) + 1
+
+        logger.info(
+            f"    液化判别表: {len(points)} 点, "
+            f"液化 {liq_count}, 不液化 {len(points) - liq_count}, "
+            f"目标层 {list(target_layer_map.keys())}, "
+            f"ILE_max={ile_max:.2f}({liq_grade_overall}), "
+            f"N/Ncr={ncr_min}~{ncr_max}"
+        )
+
+        # 按层号排序 (保持 id↔name 对应)
+        sorted_ids = sorted(target_layer_map.keys(), key=lambda x: int(x) if x.isdigit() else x)
+        sorted_names = [target_layer_map[lid] for lid in sorted_ids]
+
+        return {
+            "available": True,
+            "intensity": intensity,
+            "n0": n0,
+            "max_depth": max_depth,
+            "design_group": design_group,
+            "beta": beta,
+            "points": points,
+            "total_points": len(points),
+            "liq_points": liq_count,
+            "non_liq_points": len(points) - liq_count,
+            "target_layers": sorted_ids,
+            "target_names": sorted_names,
+            "dw_values": sorted(dw_values),
+            "ncr_ratio_min": ncr_min,
+            "ncr_ratio_max": ncr_max,
+            "ile_max": ile_max,
+            "liq_grade": liq_grade_overall,
+            "bh_ile": bh_ile,
+            "grade_dist": grade_dist,
+        }
+
     # ---- 数据汇总 ----
+
+    # ---- 覆盖层厚度 (du) 计算 ----
+
+    # 砂土关键字: 层名包含这些则为砂层 (不计算为覆盖层)
+    _SAND_KEYWORDS = ("砂", "砾", "碎石")
+
+    # 淤泥质土关键字: 层名包含这些则单独扣除
+    _SILT_MUCK_KEYWORDS = ("淤泥", )
+
+    @classmethod
+    def _is_sand_layer(cls, name: str) -> bool:
+        """判断是否为砂土层"""
+        return any(kw in name for kw in cls._SAND_KEYWORDS)
+
+    @classmethod
+    def _is_muck_layer(cls, name: str) -> bool:
+        """判断是否为淤泥质土层"""
+        return any(kw in name for kw in cls._SILT_MUCK_KEYWORDS)
+
+    def compute_overburden_thickness(
+        self,
+        bh_layers: Dict[str, List[Dict[str, Any]]],
+        descriptions: Dict[str, Dict[str, str]],
+        water_depth: float,
+    ) -> float:
+        """计算场地上覆非液化土层厚度 du (m)
+
+        规则:
+            du = 地下水位以上的非砂层总厚度 − 其中淤泥质土的厚度
+            对所有钻孔取平均值
+
+        Args:
+            bh_layers:    DCSJ 各孔地层 {bh_id: [{layer_id, depth}, ...]}
+            descriptions: ZHMS 层描述 {layer_id: {name, ...}}
+            water_depth:  地下水位埋深 dw (m)
+        """
+        du_values: List[float] = []
+
+        for bh_id, layers in bh_layers.items():
+            prev_depth = 0.0
+            non_sand_thickness = 0.0
+            muck_thickness = 0.0
+
+            for layer in layers:
+                bottom = layer.get("depth")
+                if bottom is None:
+                    continue
+                lid = layer["layer_id"]
+                name = descriptions.get(lid, {}).get("name", "")
+                top = prev_depth
+
+                # 只考虑水位以上的部分
+                if top >= water_depth:
+                    break
+                effective_bottom = min(bottom, water_depth)
+                thickness = effective_bottom - top
+
+                if not self._is_sand_layer(name):
+                    non_sand_thickness += thickness
+                    if self._is_muck_layer(name):
+                        muck_thickness += thickness
+
+                prev_depth = bottom
+
+            du = non_sand_thickness - muck_thickness
+            if du > 0:
+                du_values.append(du)
+
+        if not du_values:
+            return 0.0
+        avg = sum(du_values) / len(du_values)
+        logger.info(
+            f"    覆盖层厚度 du: {len(du_values)} 孔参与计算, "
+            f"平均 {avg:.2f}m, 范围 {min(du_values):.2f}~{max(du_values):.2f}m"
+        )
+        return round(avg, 1)
 
     def _assign_to_layer(
         self,
@@ -1460,6 +1837,7 @@ class HuaNingDBReader:
         bh_layers, unpentrated, max_exposed = self.read_borehole_layers()
         spt_records = self.read_spt_data()
         sample_records = self.read_sample_data()
+        liq_table = self.read_liquefaction_table()
 
         age_groups = self.build_age_groups(layer_sequence)
         spt_counts = self.compute_spt_counts(spt_records, bh_layers)
@@ -1485,6 +1863,7 @@ class HuaNingDBReader:
             "sample_records": sample_records,
             "spt_counts": spt_counts,
             "sample_counts": sample_counts,
+            "liquefaction_table": liq_table,
         }
 
 
@@ -2091,7 +2470,7 @@ class ReportFiller:
         # 获取地质年代名称配置覆盖
         geo_age_overrides = self.config.get_geo_age_names()
 
-        # 定位 (二) 和 (三) 节
+        # 定位 (二) 和 (三) 节 (仅匹配 Heading 2, 跳过目录条目)
         section_start = None
         section_end = None
         intro_para = None
@@ -2102,6 +2481,9 @@ class ReportFiller:
         for i, p in enumerate(self.doc.paragraphs):
             txt = p.text.strip()
             if not txt:
+                continue
+            style = p.style.name
+            if style != "Heading 2":
                 continue
             if re.match(r"[（(]二[）)]", txt):
                 section_start = i
@@ -2526,26 +2908,294 @@ class ReportFiller:
     # ---- 液化判别段落 ----
 
     def _fill_liquefaction(self) -> None:
-        liq_data, liq_liq, liq_non = self.data.get("liquefaction", ([], 0, 0))
-        logger.info(f"  液化判别 ({len(liq_data)} 点, 液化 {liq_liq})...")
+        """填充第五章(四)2 液化判别
 
-        for p in self.doc.paragraphs:
+        优先使用华宁数据库 + 液化判别表 XLS 动态生成;
+        若无数据则回退到原始模板匹配。
+        """
+        hn_data = self.data.get("hn_data", {})
+        liq_table = hn_data.get("liquefaction_table", {}) if hn_data else {}
+
+        if not liq_table or not liq_table.get("available"):
+            # 回退: 使用 Excel 导出数据的旧逻辑
+            liq_data, liq_liq, liq_non = self.data.get("liquefaction", ([], 0, 0))
+            logger.info(f"  液化判别 (模板模式, {len(liq_data)} 点, 液化 {liq_liq})...")
+            for p in self.doc.paragraphs:
+                txt = p.text.strip()
+                if "综合确定" in txt and "液化" in txt:
+                    if liq_liq > 0:
+                        set_para_text(p, "综合确定场地饱和砂土层存在液化，场地液化等级为轻微。")
+                    else:
+                        set_para_text(p, "综合确定场地饱和砂土层均不液化。")
+                    break
+                if "进行液化判别" in txt and ("个点" in txt or "个，" in txt):
+                    if liq_data:
+                        text = (
+                            f"对饱和砂土层进行液化判别共{len(liq_data)}个点，"
+                            f"其中液化{liq_liq}个点，不液化{liq_non}个点，"
+                        )
+                        text += "液化等级为轻微；" if liq_liq > 0 else "均不液化。"
+                        set_para_text(p, text)
+                    break
+            return
+
+        # ---- HN 数据库模式: 动态生成 ----
+        logger.info(
+            f"  液化判别 (HN模式, {liq_table['total_points']} 点, "
+            f"液化 {liq_table['liq_points']})..."
+        )
+
+        # 基础参数
+        dw_values = liq_table["dw_values"]
+        # 用平均水位做初判 (逐孔 SPT 判别用各孔自己的水位)
+        dw = sum(dw_values) / len(dw_values) if dw_values else 1.0
+        intensity = liq_table["intensity"]
+        n0 = liq_table["n0"]
+        d0 = HuaNingDBReader.INTENSITY_TO_D0.get(intensity, 7)
+        design_group = liq_table["design_group"]
+
+        # db 从 config 读取, 默认 1.5
+        overview = self.config.get_project_overview()
+        db = float(overview.get("db_foundation_depth", 1.5))
+
+        # du 计算
+        bh_layers = hn_data.get("borehole_layers", {})
+        descriptions = hn_data.get("descriptions", {})
+        du = HuaNingDBReader(self.config.get_hn_db_dir(),
+                             self.config.get_hn_project_code()
+                             ).compute_overburden_thickness(bh_layers, descriptions, dw)
+
+        # 目标层信息
+        target_layer_ids = liq_table["target_layers"]
+        target_names = liq_table["target_names"]
+        target_display = "、".join(
+            f"第{lid}层{name}"
+            for lid, name in zip(target_layer_ids, target_names)
+        )
+        first_target_id = target_layer_ids[0] if target_layer_ids else ""
+        first_target_name = target_names[0] if target_names else ""
+
+        # 地质年代 (从 DCSH)
+        layer_sequence = hn_data.get("layer_sequence", [])
+        target_age = ""
+        for rec in layer_sequence:
+            if rec["layer_id"] == first_target_id:
+                target_age = rec.get("age", "")
+                break
+
+        # 年代显示名
+        age_display = HuaNingDBReader.AGE_PREFIXES.get(target_age, target_age)
+        if target_age == "Q4":
+            age_condition_text = "第四纪全新世"
+        elif target_age == "Q3":
+            age_condition_text = "第四纪晚更新世（Q3）"
+        elif target_age in ("Q2", "Q1"):
+            age_condition_text = f"{age_display}（{target_age}）及其以前"
+        else:
+            age_condition_text = age_display
+
+        # SPT 统计
+        total = liq_table["total_points"]
+        liq_count = liq_table["liq_points"]
+        non_liq_count = liq_table["non_liq_points"]
+        ncr_min = liq_table.get("ncr_ratio_min")
+        ncr_max = liq_table.get("ncr_ratio_max")
+        ile_max = liq_table.get("ile_max", 0.0)
+        liq_grade = liq_table.get("liq_grade", "")
+        grade_dist = liq_table.get("grade_dist", {})
+
+        # ---- 定位液化判别段落范围 ----
+        liq_heading_idx = None
+        next_heading_idx = None
+
+        for i, p in enumerate(self.doc.paragraphs):
             txt = p.text.strip()
-            if "综合确定" in txt and "液化" in txt:
-                if liq_liq > 0:
-                    set_para_text(p, "综合确定场地饱和砂土层存在液化，场地液化等级为轻微。")
-                else:
-                    set_para_text(p, "综合确定场地饱和砂土层均不液化。")
-                break
-            if "进行液化判别" in txt and ("个点" in txt or "个，" in txt):
-                if liq_data:
-                    text = (
-                        f"对饱和砂土层进行液化判别共{len(liq_data)}个点，"
-                        f"其中液化{liq_liq}个点，不液化{liq_non}个点，"
-                    )
-                    text += "液化等级为轻微；" if liq_liq > 0 else "均不液化。"
-                    set_para_text(p, text)
-                break
+            if not txt:
+                continue
+            # "2、液化判别"
+            if re.match(r"2、液化判别", txt):
+                liq_heading_idx = i
+            # "3、软土震陷" or "3、" 紧跟其后
+            elif liq_heading_idx is not None and next_heading_idx is None:
+                if re.match(r"3、", txt):
+                    next_heading_idx = i
+                    break
+
+        if liq_heading_idx is None:
+            logger.warning("    未找到'2、液化判别'标题, 跳过")
+            return
+
+        if next_heading_idx is None:
+            # 如果没找到 "3、" 就取到 (五) 或下一个 Heading 2
+            for i in range(liq_heading_idx + 1, len(self.doc.paragraphs)):
+                style = self.doc.paragraphs[i].style.name
+                if style == "Heading 2" or style.startswith("样式 标题"):
+                    next_heading_idx = i
+                    break
+            if next_heading_idx is None:
+                next_heading_idx = len(self.doc.paragraphs)
+
+        # 获取模板段落 (用于格式克隆)
+        template_para = self.doc.paragraphs[liq_heading_idx]
+
+        # ---- 清空原有段落 (全部移除, 公式图片后续手动补回) ----
+        to_remove = []
+        body = self.doc.element.body
+        for i in range(liq_heading_idx + 1, next_heading_idx):
+            p = self.doc.paragraphs[i]
+            to_remove.append(p._element)
+
+        # 批量移除 (避免循环中删除导致索引偏移)
+        for elem in to_remove:
+            body.remove(elem)
+
+        # ---- 生成新段落 ----
+        dw_str = f"{dw:.2f}"
+        du_str = f"{du:.1f}" if du != int(du) else f"{du:.0f}"
+        db_str = f"{db:.1f}" if db != int(db) else f"{db:.0f}"
+
+        # 条件 (3) 公式值
+        cond3_a = f"du>{d0}+{db_str}-2"
+        cond3_b = f"dw>{d0}+{db_str}-3"
+        cond3_c = f"du+dw>1.5×{d0}+2×{db_str}-4.5"
+
+        # 计算条件 (3) 的实际值
+        du_val = du
+        dw_val = dw
+        rhs_a = d0 + db - 2
+        rhs_b = d0 + db - 3
+        rhs_c = 1.5 * d0 + 2 * db - 4.5
+
+        cond3_a_met = du_val > rhs_a
+        cond3_b_met = dw_val > rhs_b
+        cond3_c_met = (du_val + dw_val) > rhs_c
+        cond3_any = cond3_a_met or cond3_b_met or cond3_c_met
+
+        # 初判结论
+        cond1_met = target_age in ("Q3", "Q2", "Q1") and intensity <= 8
+        # 条件2 需要黏粒含量, 砂土不满足
+        cond2_met = False  # 砂土不满足条件2
+
+        # 构建段落文本列表
+        new_paras = []
+
+        # 1) 开头段
+        new_paras.append(
+            f"地下水位深度按埋深{dw_str}m考虑，地面下20m深度内饱和砂（粉）土层为"
+            f"{target_display}。根据《建筑抗震设计标准》(GB/T50011-2010  2024年版)"
+            f"4.3.3进行初步判别，满足条件之一时可初步判别为不液化或可不考虑液化影响，"
+            f"初步判别条件如下："
+        )
+
+        # 2) 三个初判条件
+        new_paras.append(
+            f"(1)地质年代为第四纪晚更新世（Q3）及其以前时，7、8度时可判为不液化土；"
+        )
+        new_paras.append(
+            "(2)粉土的黏粒（粒径小于0.005mm的颗粒）含量百分率，"
+            "7度、8度、9度分别不小于10、13和16时，可判为不液化土；"
+        )
+        new_paras.append(
+            "(3)浅埋天然地基的建筑，当上覆非液化土层厚度和地下水位深度"
+            "符合下列条件之一时，可不考虑液化影响："
+        )
+
+        # 3) 条件 (3) 公式
+        new_paras.append(f"            du>d0+db-2")
+        new_paras.append(f"            dw>d0+db-3")
+        new_paras.append(f"            du+dw>1.5d0+2db-4.5")
+
+        # 4) 初判结果
+        cond1_text = (
+            f"{first_target_name}为{age_condition_text}"
+            if cond1_met else
+            f"第{first_target_id}层{first_target_name}为{age_condition_text}，不满足条件（1）"
+        )
+        cond2_text = (
+            f"满足条件（2）"
+            if cond2_met else
+            f"第{first_target_id}层{first_target_name}为砂土，不满足条件（2）"
+        )
+
+        # 条件3 详细判定
+        cond3_detail = (
+            f"地下水位深度dW按{dw_str}m、上覆非液化土层厚度du按{du_str}m、"
+            f"基础埋置深度db按{db_str}m、液化土特征深度d0按{d0:.1f}m"
+        )
+        if cond3_any:
+            cond3_text = f"{cond3_detail}，满足条件（3），可不考虑液化影响。"
+        else:
+            cond3_text = f"{cond3_detail}，经判别不满足条件（3），需进行进一步判别。"
+
+        new_paras.append(
+            f"初步判定情况：{cond1_text}；{cond2_text}；{cond3_text}"
+        )
+
+        # 5) SPT 复判 (始终执行)
+        new_paras.append(
+            f"根据《建筑抗震设计标准》（GB/T50011—2010  2024年版）4.3.4节"
+            f"使用标准贯入试验判别法对{target_display}进一步进行液化判别，"
+            f"判别深度20.0m，地下水水位埋深按{dw_str}m。标准贯入试验液化判别公式"
+            f"和液化指数的计算公式如下："
+        )
+
+        # 6) 公式占位 (保留空行, 用户插入公式图片)
+        new_paras.append("")
+        new_paras.append("")
+        new_paras.append("")
+
+        # 7) SPT 结果 + N/Ncr
+        ncr_range_text = ""
+        if ncr_min is not None and ncr_max is not None:
+            ncr_range_text = f"，N/Ncr范围{ncr_min:.2f}~{ncr_max:.2f}"
+        new_paras.append(
+            f"{target_display}进行液化判别{total}个点，"
+            f"其中液化点{liq_count}个，不液化点{non_liq_count}个{ncr_range_text}，"
+            f"详见标准贯入试验液化判别及液化指数计算成果表。"
+        )
+
+        # 8) 综合结论 (含液化指数和等级)
+        if liq_count > 0:
+            # 液化等级分布描述
+            grade_parts = []
+            for g_name in ("轻微", "中等", "严重"):
+                cnt = grade_dist.get(g_name, 0)
+                if cnt > 0:
+                    grade_parts.append(f"{g_name}{cnt}个孔")
+            grade_text = "、".join(grade_parts) if grade_parts else ""
+
+            if grade_text:
+                new_paras.append(
+                    f"综合判定场地{target_display}存在液化，"
+                    f"最大液化指数ILE={ile_max:.2f}，"
+                    f"液化等级为{liq_grade}（{grade_text}）。"
+                )
+            else:
+                new_paras.append(
+                    f"综合判定场地{target_display}存在液化，"
+                    f"最大液化指数ILE={ile_max:.2f}，液化等级为{liq_grade}。"
+                )
+        else:
+            new_paras.append(
+                f"综合判定场地{target_display}不液化。"
+            )
+
+        # ---- 插入段落 ----
+        anchor = self.doc.paragraphs[liq_heading_idx]._element
+        inserted = []
+        for text in new_paras:
+            p = self._make_normal_paragraph(text, template_para)
+            inserted.append(p)
+
+        for elem in reversed(inserted):
+            anchor.addnext(elem)
+
+        logger.info(
+            f"    HN模式: du={du_str}m, dw={dw_str}m, db={db_str}m, "
+            f"d0={d0}m, 初判{cond1_met=}/{cond2_met=}/{cond3_any=}, "
+            f"SPT: {total}点(液化{liq_count}), "
+            f"ILE={ile_max:.2f}({liq_grade}), N/Ncr={ncr_min}~{ncr_max}"
+        )
 
     # ---- 基础建议表 + 桩基参数 ----
 
@@ -2795,6 +3445,19 @@ class ReportFiller:
             "liquefaction_result": auto_liq_short,
         }
 
+        # 场地位置 (从 project_overview 注入)
+        overview = self.config.get_project_overview()
+        fmt_vars["site_location"] = overview.get("site_location", "")
+
+        # 地震参数 (自动查表 + config覆盖)
+        seismic_params = self.config.get_seismic_params()
+        if seismic_params:
+            # 注入: {pga} {period} {intensity} {group}
+            fmt_vars["pga"] = seismic_params.get("pga", "")
+            fmt_vars["period"] = seismic_params.get("period", "")
+            fmt_vars["intensity"] = seismic_params.get("intensity", "")
+            fmt_vars["group"] = seismic_params.get("group", "")
+
         # 触发词 → 配置键映射
         triggers: List[Tuple[List[str], str]] = [
             (["地貌单元", "所处地貌"], "terrain_text"),
@@ -2814,6 +3477,10 @@ class ReportFiller:
         for p in self.doc.paragraphs:
             txt = p.text.strip()
             if not txt:
+                continue
+
+            # 跳过子节标题行 (如 "1、地震设计基本参数", "2、液化判别")
+            if re.match(r"^\d+、", txt) and len(txt) < 20:
                 continue
 
             for keywords, config_key in triggers:
