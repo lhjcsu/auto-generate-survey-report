@@ -2907,14 +2907,60 @@ class ReportFiller:
 
     # ---- 液化判别段落 ----
 
+    def _replace_liquefaction_content(self, new_text: str) -> None:
+        """清空 "2、液化判别" 与 "3、" 之间的模板段落，插入单段新文本"""
+        liq_heading_idx = None
+        next_heading_idx = None
+
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if not txt:
+                continue
+            if re.match(r"2、液化判别", txt):
+                liq_heading_idx = i
+            elif liq_heading_idx is not None and next_heading_idx is None:
+                if re.match(r"3、", txt):
+                    next_heading_idx = i
+                    break
+
+        if liq_heading_idx is None:
+            logger.warning("    未找到'2、液化判别'标题, 跳过")
+            return
+
+        # 移除两个标题之间的所有段落
+        body = self.doc.element.body
+        to_remove = []
+        for i in range(liq_heading_idx + 1, next_heading_idx if next_heading_idx else len(self.doc.paragraphs)):
+            to_remove.append(self.doc.paragraphs[i]._element)
+        for elem in to_remove:
+            body.remove(elem)
+
+        # 插入新段落
+        anchor = self.doc.paragraphs[liq_heading_idx]
+        new_para = self._make_normal_paragraph(new_text, anchor)
+        anchor._element.addnext(new_para)
+
     def _fill_liquefaction(self) -> None:
         """填充第五章(四)2 液化判别
 
         优先使用华宁数据库 + 液化判别表 XLS 动态生成;
+        若无砂土层则输出简短说明;
         若无数据则回退到原始模板匹配。
         """
         hn_data = self.data.get("hn_data", {})
         liq_table = hn_data.get("liquefaction_table", {}) if hn_data else {}
+
+        # ---- 检查是否有可液化砂土层 ----
+        liq_layers_cfg = self.config.raw.get("liquefaction_layers", {})
+        has_sand = bool(liq_layers_cfg) or (
+            liq_table and liq_table.get("available") and liq_table.get("target_layers")
+        )
+
+        if not has_sand:
+            logger.info("  液化判别 (无砂土层)")
+            no_sand_text = "拟建场区无饱和砂土和饱和粉土层，因此不考虑场区地基土的液化影响。"
+            self._replace_liquefaction_content(no_sand_text)
+            return
 
         if not liq_table or not liq_table.get("available"):
             # 回退: 使用 Excel 导出数据的旧逻辑
@@ -3468,7 +3514,6 @@ class ReportFiller:
             (["等效剪切波速", "场地类别判定"], "site_class_text"),
             (["地震稳定性"], "seismic_stability_text"),
             (["抗震地段"], "seismic_zone_text"),
-            (["软土震陷", "震陷判别"], "soft_soil_text"),
             (["不良地质作用"], "adverse_text"),
             (["不利埋藏物", "埋藏的河道"], "buried_text"),
         ]
@@ -3495,6 +3540,36 @@ class ReportFiller:
                     set_para_text(p, filled)
                     replaced_count += 1
                     break
+
+        # ---- 软土震陷判别: 位置定位 ----
+        # 找到 "3、软土震陷判别" 标题，替换其后的内容段落
+        _DEFAULT_SOFT_SOIL = (
+            "根据《岩土工程勘察规范》（2009年版）（GB50021-2001）第5.7.11条"
+            "及表5.5，场区不存在软弱层，因此不需要考虑震陷影响。"
+        )
+        soft_soil_cfg = sc.get("soft_soil_text", "")
+        soft_soil_text = soft_soil_cfg if soft_soil_cfg else _DEFAULT_SOFT_SOIL
+        try:
+            soft_soil_text = soft_soil_text.format(**fmt_vars)
+        except KeyError:
+            pass
+
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if re.match(r"3、软土震陷", txt) or re.match(r"3、.*震陷判别", txt):
+                # 替换标题之后的第一个非空段落
+                for j in range(i + 1, min(i + 5, len(self.doc.paragraphs))):
+                    p2 = self.doc.paragraphs[j]
+                    t2 = p2.text.strip()
+                    if not t2:
+                        continue
+                    # 遇到下一个子节标题 "4、" 则停止
+                    if re.match(r"4、", t2):
+                        break
+                    set_para_text(p2, soft_soil_text)
+                    replaced_count += 1
+                    break
+                break
 
         if replaced_count:
             logger.info(f"  场地条件: 替换 {replaced_count} 段")
