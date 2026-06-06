@@ -1167,14 +1167,35 @@ class HuaNingDBReader:
         "fgl": "冰水沉积层",
     }
 
-    # 年代代号 → 中文前缀
+    # 年代代号 → 中文前缀 (按代→纪→世 层级排列)
     AGE_PREFIXES = {
+        # 新生代
+        "Cz": "新生代",
+        "Q": "第四纪",
         "Q4": "第四系全新统",
         "Q3": "第四系上更新统",
         "Q2": "第四系中更新统",
         "Q1": "第四系下更新统",
-        "N": "新近系",
-        "Nh": "新元古界",
+        "N": "新近纪",
+        # 中生代
+        "Mz": "中生代",
+        "K": "白垩纪",
+        "K1": "早白垩世",
+        "J": "侏罗纪",
+        "J2": "中侏罗世",
+        "T": "三叠纪",
+        "T3": "晚三叠世",
+        # 新元古代
+        "Pt3": "新元古代",
+        "Nh": "南华纪",
+        # 中元古代
+        "Pt2": "中元古代",
+        "Ch": "长城纪",
+        # 古元古代
+        "Pt1": "古元古代",
+        # 太古宙
+        "Ar3": "新太古代",
+        # 泛称 (保留向后兼容)
         "Pt": "元古界",
         "Ar": "太古界",
     }
@@ -1892,6 +1913,9 @@ class HuaNingDBReader:
         age = parts[0]
         origin = parts[1] if len(parts) > 1 else ""
 
+        # 年代前缀匹配: 复杂代码 (如 NhηγRw) 用最长前缀查表
+        age_prefix = self._lookup_age_prefix(age)
+
         # 基岩 (无成因)
         if not origin:
             rock_name = ""
@@ -1907,12 +1931,23 @@ class HuaNingDBReader:
             # 尝试从岩石代码映射
             if not rock_name:
                 rock_name = self.ROCK_TYPE_MAP.get("150", "花岗片麻岩")
-            return f"{self.AGE_PREFIXES.get(age, age)}{rock_name}（{age}）"
+            return f"{age_prefix}{rock_name}（{age}）"
 
         # 第四系沉积层
-        age_prefix = self.AGE_PREFIXES.get(age, age)
         origin_name = self.ORIGIN_NAMES.get(origin, origin + "层")
         return f"{age_prefix}{origin_name}（{age}{origin}）"
+
+    @staticmethod
+    def _lookup_age_prefix(age: str) -> str:
+        """年代代码前缀匹配: 对复杂代码 (如 NhηγRw) 在 AGE_PREFIXES 中
+        找到最长匹配前缀, 未匹配则返回原值"""
+        best = age  # 默认: 原样返回
+        best_len = 0
+        for key, val in HuaNingDBReader.AGE_PREFIXES.items():
+            if age.startswith(key) and len(key) > best_len:
+                best = val
+                best_len = len(key)
+        return best
 
     # ---- 主读取入口 ----
 

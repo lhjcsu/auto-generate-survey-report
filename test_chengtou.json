@@ -1,0 +1,26 @@
+{
+  "project_name": "城投文化中路住宅项目",
+  "base_dir": "D:\\项目\\城投文化中路住宅项目",
+  "excel_dir": "表格",
+  "template": "C:\\Users\\Administrator\\Desktop\\城投文化路项目.docx",
+  "output_suffix": "_波速测试",
+  "hn_db_dir": "D:\\项目\\城投文化中路住宅项目\\sj",
+  "hn_project_code": "17",
+  "project_overview": {
+    "client": "威海城投置业有限公司",
+    "survey_stage": "详细勘察",
+    "commission_text": "受{client}的委托，我单位承担了其拟建{project_name}{survey_stage}阶段的岩土工程勘察工作。",
+    "site_location": "勘察场地位于威海一中对面，文化中路南，古寨西路东。",
+    "building_desc": "本次勘察建筑物包括21栋11F和17F住宅楼，南北2栋地下车库，北侧和东西2侧有1-3层临街商业及附属用房。",
+    "importance_level": "二级",
+    "site_complexity": "二级",
+    "foundation_grade": "一级",
+    "survey_grade": "甲级",
+    "frozen_depth": "0.50m",
+    "has_basement": true
+  },
+  "replacements": [],
+  "date_replacements": [],
+  "layers": [],
+  "table_indices": {}
+}
