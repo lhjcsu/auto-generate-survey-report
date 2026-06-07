@@ -3155,6 +3155,39 @@ class ReportFiller:
         self.config = config
         self.ti = config.table_indices  # 表格索引快捷引用
         self.doc = Document(template_path)
+        self._para_index: Dict[str, List[int]] = {}
+        self._build_para_index()
+
+
+    def _build_para_index(self) -> None:
+        """构建段落文本索引: 关键词 -> [段落位置列表]"""
+        self._para_index.clear()
+        for i, p in enumerate(self.doc.paragraphs):
+            txt = p.text.strip()
+            if not txt:
+                continue
+            # 对每个段落, 按常见分隔符拆分关键词
+            # 存储完整文本和前20字符作为索引键
+            key = txt[:50]  # 前50字符足以区分
+            if key not in self._para_index:
+                self._para_index[key] = []
+            self._para_index[key].append(i)
+        logger.debug(f"段落索引构建完成: {len(self._para_index)} 个唯一键")
+
+    def _find_para(self, keyword: str) -> List[Tuple[int, Any]]:
+        """在索引中查找包含关键词的段落, 返回 [(index, paragraph), ...]"""
+        results = []
+        for key, indices in self._para_index.items():
+            if keyword in key:
+                for idx in indices:
+                    results.append((idx, self.doc.paragraphs[idx]))
+        return results
+
+    def _find_para_by_index(self, idx: int) -> Any:
+        """按索引获取段落"""
+        if 0 <= idx < len(self.doc.paragraphs):
+            return self.doc.paragraphs[idx]
+        return None
 
     def save(self) -> None:
         """保存生成的报告"""
@@ -3174,6 +3207,7 @@ class ReportFiller:
         self._fill_workload()
         self._fill_water_level()
         self._fill_layer_descriptions()
+        self._build_para_index()  # 地层描述会插入段落, 重建索引
         self._fill_phys_spt_tables()
         self._fill_bearing_capacity()
         self._fill_water_salt_tables()
@@ -3844,6 +3878,7 @@ class ReportFiller:
                             elv_min=fmt_val(ldata.get("elv_min")),
                             elv_max=fmt_val(ldata.get("elv_max")),
                             elv_avg=fmt_val(ldata.get("elv_avg")),
+                        )
                     except (KeyError, IndexError) as _e:
                         logger.debug(f"Layer desc format failed: lid={lid}, error={_e}")
 
@@ -4877,9 +4912,9 @@ class ReportFiller:
         soft_soil_cfg = sc.get("soft_soil_text", "")
         soft_soil_text = soft_soil_cfg if soft_soil_cfg else _DEFAULT_SOFT_SOIL
         try:
+            soft_soil_text = soft_soil_text.format(**fmt_vars)
         except KeyError as _e:
             logger.debug(f"soft_soil_text placeholder missing: {_e}")
-            pass
 
         for i, p in enumerate(self.doc.paragraphs):
             txt = p.text.strip()
