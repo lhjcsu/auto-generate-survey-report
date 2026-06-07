@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 岩土工程勘察报告 — 自动生成工具 v4.0
@@ -2913,8 +2913,8 @@ def extract_building_borehole_mapping(
                 try:
                     parts = dim_str.replace("x", "×").split("×")
                     half_w = float(parts[0]) / 2
-                    half_h = float(parts[1]) / 2
-                except Exception:
+                except Exception as _e:
+                    logger.debug(f"DXF dim parse failed: dim={dim_str}")
                     pass
 
             # 评估 DXF 轮廓是否可用 (面积应 >= 建筑信息面积 50%)
@@ -3797,7 +3797,8 @@ class ReportFiller:
         # 否则在末尾添加
         if closing_para is not None and closing_para._element.getparent() is not None:
             # closing 段落还在, 移到 section_end 之前
-            pass
+            # TODO: 实现 closing 段落重定位逻辑 (当前保留原位)
+            logger.debug("closing段落仍存在, 暂未重定位")
         else:
             closing_para = None
 
@@ -3843,9 +3844,9 @@ class ReportFiller:
                             elv_min=fmt_val(ldata.get("elv_min")),
                             elv_max=fmt_val(ldata.get("elv_max")),
                             elv_avg=fmt_val(ldata.get("elv_avg")),
-                        )
-                    except (KeyError, IndexError):
-                        pass
+                    except (KeyError, IndexError) as _e:
+                        logger.debug(f"Layer desc format failed: lid={lid}, error={_e}")
+
 
                 # 构建完整段落
                 display_name = self._build_layer_display_name(lid, name, geo_code)
@@ -4876,8 +4877,8 @@ class ReportFiller:
         soft_soil_cfg = sc.get("soft_soil_text", "")
         soft_soil_text = soft_soil_cfg if soft_soil_cfg else _DEFAULT_SOFT_SOIL
         try:
-            soft_soil_text = soft_soil_text.format(**fmt_vars)
-        except KeyError:
+        except KeyError as _e:
+            logger.debug(f"soft_soil_text placeholder missing: {_e}")
             pass
 
         for i, p in enumerate(self.doc.paragraphs):
