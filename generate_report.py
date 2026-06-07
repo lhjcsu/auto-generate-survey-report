@@ -3516,6 +3516,24 @@ class ReportFiller:
                             replace_in_para(p, grade, survey_grade)
                             break
 
+        # --- 工作进度: 日期+钻机注入 (第三章) ---
+        fw_start = (overview or {}).get("fieldwork_start", "")
+        fw_end = (overview or {}).get("fieldwork_end", "")
+        rig_count = (overview or {}).get("rig_count", "")
+        if fw_start or fw_end or rig_count:
+            for p in self.doc.paragraphs:
+                txt = p.text.strip()
+                if "外业工作" in txt and ("钻机" in txt or "台" in txt):
+                    parts = []
+                    if fw_start and fw_end:
+                        parts.append(f"外业勘察工作于{fw_start}至{fw_end}进行")
+                    elif fw_start:
+                        parts.append(f"外业勘察工作于{fw_start}开始进行")
+                    if rig_count:
+                        parts.append(f"投入XY-100型钻机{rig_count}台")
+                    set_para_text(p, "，".join(parts) + "。")
+                    break
+
     # ---- 水位表 + 段落 ----
 
     def _fill_water_level(self) -> None:
